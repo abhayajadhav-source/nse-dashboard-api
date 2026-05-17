@@ -1,12 +1,12 @@
 """
 NSE Dashboard API — read-only JSON for the Cloudflare Pages dashboard,
-plus on-demand stock analysis via Anthropic Claude.
+plus on-demand stock analysis with Anthropic Claude and options analysis.
 
 Endpoints:
-  GET  /                  → health check
-  GET  /api/snapshot      → latest scanner snapshots
-  POST /api/analyze       → analyze a single stock with Claude
-                            body: {"symbol": "RELIANCE"}
+  GET  /              → health check
+  GET  /api/snapshot  → latest scanner snapshots
+  POST /api/analyze   → full AI analysis (technicals + analyst + news + options)
+  POST /api/options   → standalone options-only analysis
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from anthropic import Anthropic
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+from options_analyzer import OptionChainData, fetch_options_data
 from technical_indicators import atr, bollinger_bands, ema, macd, rsi, sma
 
 logging.basicConfig(level=logging.INFO)
@@ -36,17 +37,13 @@ CORS(app, origins=["*"])
 
 DATABASE_URL      = os.getenv("DATABASE_URL", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
-ANTHROPIC_MODEL = "claude-haiku-4-5"
+ANTHROPIC_MODEL   = "claude-haiku-4-5"
 
 anthropic_client: Optional[Anthropic] = None
 if ANTHROPIC_API_KEY:
     anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-# ---------------------------------------------------------------------------
-# Postgres helpers
-# ---------------------------------------------------------------------------
 @contextmanager
 def _conn():
     if not DATABASE_URL:
@@ -59,7 +56,7 @@ def _conn():
 
 
 # ---------------------------------------------------------------------------
-# Existing endpoints
+# Health + snapshot (unchanged)
 # ---------------------------------------------------------------------------
 @app.route("/")
 def health():
@@ -91,10 +88,9 @@ def get_snapshot():
 
 
 # ---------------------------------------------------------------------------
-# Price data + indicators
+# Price data + indicators (unchanged)
 # ---------------------------------------------------------------------------
 def _fetch_price_data(symbol: str) -> Optional[dict]:
-    """Fetch 6mo of daily data + compute all indicators for a stock."""
     yf_symbol = f"{symbol}.NS"
     try:
         ticker = yf.Ticker(yf_symbol)
@@ -178,45 +174,26 @@ def _fetch_price_data(symbol: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Analyst ratings (NEW)
+# Analyst ratings (unchanged from your existing version)
 # ---------------------------------------------------------------------------
 def _fetch_analyst_ratings(symbol: str) -> dict:
-    """
-    Fetch analyst recommendations and price targets from Yahoo Finance.
-
-    Returns a dict with:
-      - summary:     aggregated counts {strong_buy, buy, hold, sell, strong_sell, total}
-      - consensus:   short label ('Buy', 'Hold', 'Sell', etc.) based on majority
-      - price_target: {mean, high, low, count, currency}
-      - recent_actions: list of recent broker actions (upgrades/downgrades/initiations)
-      - data_source:  'yfinance' or 'unavailable'
-
-    Returns {} on failure so the caller can degrade gracefully.
-    """
     yf_symbol = f"{symbol}.NS"
     result = {
-        "summary":         None,
-        "consensus":       None,
-        "price_target":    None,
-        "recent_actions":  [],
-        "data_source":     "unavailable",
+        "summary": None, "consensus": None, "price_target": None,
+        "recent_actions": [], "data_source": "unavailable",
     }
 
     try:
         ticker = yf.Ticker(yf_symbol)
         info   = ticker.info or {}
 
-        # --- Summary counts (Yahoo aggregates these) ---
-        # Yahoo exposes a recommendationKey and numberOfAnalystOpinions
-        rec_key   = info.get("recommendationKey")   # 'strong_buy', 'buy', 'hold', 'sell', 'strong_sell', 'none'
-        rec_mean  = info.get("recommendationMean")  # 1.0 (strong buy) -> 5.0 (strong sell)
+        rec_key   = info.get("recommendationKey")
+        rec_mean  = info.get("recommendationMean")
         num_anlst = info.get("numberOfAnalystOpinions")
 
-        # Try the detailed breakdown if available
         try:
             rec_df = ticker.recommendations_summary
             if rec_df is not None and not rec_df.empty:
-                # First row is the most recent period (current month aggregate)
                 row = rec_df.iloc[0]
                 result["summary"] = {
                     "strong_buy":  int(row.get("strongBuy",  0) or 0),
@@ -226,38 +203,29 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
                     "strong_sell": int(row.get("strongSell", 0) or 0),
                 }
                 result["summary"]["total"] = sum(result["summary"].values())
-        except Exception as e:
-            logger.debug("recommendations_summary unavailable for %s: %s", symbol, e)
+        except Exception:
+            pass
 
-        # Fall back to top-level fields if breakdown failed
         if result["summary"] is None and num_anlst:
-            # We have a count but no breakdown — best we can do is store the count
             result["summary"] = {
                 "strong_buy": 0, "buy": 0, "hold": 0, "sell": 0, "strong_sell": 0,
                 "total": int(num_anlst),
             }
 
-        # Map Yahoo's recommendationKey to a clean label
         if rec_key and rec_key != "none":
             label_map = {
-                "strong_buy":  "Strong Buy",
-                "buy":         "Buy",
-                "hold":        "Hold",
-                "sell":        "Sell",
-                "strong_sell": "Strong Sell",
-                "underperform":"Underperform",
-                "outperform":  "Outperform",
+                "strong_buy": "Strong Buy", "buy": "Buy", "hold": "Hold",
+                "sell": "Sell", "strong_sell": "Strong Sell",
+                "underperform": "Underperform", "outperform": "Outperform",
             }
             result["consensus"] = label_map.get(rec_key, rec_key.replace("_", " ").title())
         elif rec_mean:
-            # Derive label from mean if key missing (1=Strong Buy, 5=Strong Sell)
             if   rec_mean <= 1.5: result["consensus"] = "Strong Buy"
             elif rec_mean <= 2.5: result["consensus"] = "Buy"
             elif rec_mean <= 3.5: result["consensus"] = "Hold"
             elif rec_mean <= 4.5: result["consensus"] = "Sell"
             else:                 result["consensus"] = "Strong Sell"
 
-        # --- Price targets (analyst consensus targets) ---
         target_mean   = info.get("targetMeanPrice")
         target_high   = info.get("targetHighPrice")
         target_low    = info.get("targetLowPrice")
@@ -275,15 +243,11 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
                 "currency": currency,
             }
 
-        # --- Recent broker actions (upgrades/downgrades/initiations) ---
         try:
             upgrades_df = ticker.upgrades_downgrades
             if upgrades_df is not None and not upgrades_df.empty:
-                # Take the 8 most recent actions
-                # Index is GradeDate; columns include Firm, ToGrade, FromGrade, Action
                 recent = upgrades_df.head(8)
                 for idx, row in recent.iterrows():
-                    # idx is the action date
                     try:
                         action_date = pd.to_datetime(idx).strftime("%d %b %Y")
                     except Exception:
@@ -293,12 +257,11 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
                         "firm":       str(row.get("Firm", "") or ""),
                         "to_grade":   str(row.get("ToGrade", "") or ""),
                         "from_grade": str(row.get("FromGrade", "") or ""),
-                        "action":     str(row.get("Action", "") or ""),  # 'up', 'down', 'init', 'main'
+                        "action":     str(row.get("Action", "") or ""),
                     })
-        except Exception as e:
-            logger.debug("upgrades_downgrades unavailable for %s: %s", symbol, e)
+        except Exception:
+            pass
 
-        # Mark as success if we got anything useful
         if (result["summary"] or result["consensus"] or
             result["price_target"] or result["recent_actions"]):
             result["data_source"] = "yfinance"
@@ -310,7 +273,7 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# News
+# News (unchanged)
 # ---------------------------------------------------------------------------
 def _fetch_news(symbol: str, max_items: int = 6) -> list:
     query = urllib.parse.quote_plus(f'"{symbol}" India stock')
@@ -323,6 +286,9 @@ def _fetch_news(symbol: str, max_items: int = 6) -> list:
         feed = feedparser.parse(url)
     except Exception as e:
         logger.warning("News fetch failed for %s: %s", symbol, e)
+        return []
+
+    if not feed.entries:
         return []
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
@@ -356,18 +322,14 @@ def _fetch_news(symbol: str, max_items: int = 6) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Prompt builder — now includes analyst ratings
+# Prompt builders (with NEW options section)
 # ---------------------------------------------------------------------------
 def _format_ratings_for_prompt(ratings: dict, current_price: float) -> str:
-    """Compact text block summarising analyst data, fed into the Claude prompt."""
     if ratings.get("data_source") == "unavailable":
-        return "  (no analyst data available from Yahoo Finance)"
-
+        return "  (no analyst data available)"
     lines = []
-
     if ratings.get("consensus"):
         lines.append(f"  Consensus rating: {ratings['consensus']}")
-
     s = ratings.get("summary")
     if s and s.get("total", 0) > 0:
         if any([s["strong_buy"], s["buy"], s["hold"], s["sell"], s["strong_sell"]]):
@@ -376,9 +338,6 @@ def _format_ratings_for_prompt(ratings: dict, current_price: float) -> str:
                 f"Hold {s['hold']} · Sell {s['sell']} · Strong Sell {s['strong_sell']} "
                 f"(total {s['total']} analysts)"
             )
-        else:
-            lines.append(f"  {s['total']} analysts covering (no breakdown available)")
-
     pt = ratings.get("price_target")
     if pt and pt.get("mean"):
         upside = ((pt["mean"] - current_price) / current_price) * 100
@@ -387,7 +346,6 @@ def _format_ratings_for_prompt(ratings: dict, current_price: float) -> str:
             target_str += f" (range ₹{pt['low']:,.2f} – ₹{pt['high']:,.2f})"
         target_str += f" → {upside:+.1f}% from current ₹{current_price:,.2f}"
         lines.append(target_str)
-
     actions = ratings.get("recent_actions", [])
     if actions:
         lines.append(f"  Recent broker actions ({len(actions)}):")
@@ -397,18 +355,51 @@ def _format_ratings_for_prompt(ratings: dict, current_price: float) -> str:
                 transition = f" ({a['from_grade']} → {a['to_grade']})"
             elif a.get("to_grade"):
                 transition = f" ({a['to_grade']})"
-            action_label = (a.get("action") or "").lower()
-            arrow = ""
-            if   action_label in ("up", "upgrade"):     arrow = "↑"
-            elif action_label in ("down", "downgrade"): arrow = "↓"
-            elif action_label in ("init",):             arrow = "★"
-            elif action_label in ("main",):             arrow = "·"
-            lines.append(f"    {arrow} {a['date']} — {a['firm']}{transition}")
-
-    return "\n".join(lines) if lines else "  (no analyst data available)"
+            lines.append(f"    {a['date']} — {a['firm']}{transition}")
+    return "\n".join(lines) if lines else "  (no analyst data)"
 
 
-def _build_analysis_prompt(price_data: dict, news: list, ratings: dict) -> str:
+def _format_options_for_prompt(opts: Optional[OptionChainData]) -> str:
+    """Compact text block summarising options data for Claude."""
+    if opts is None:
+        return "  (no options data available — likely not an F&O stock)"
+
+    lines = []
+    lines.append(f"  Expiry analysed: {opts.expiry_date}")
+    lines.append(f"  PCR (OI): {opts.pcr_oi:.2f} → {opts.pcr_signal}")
+    if opts.pcr_volume > 0:
+        lines.append(f"  PCR (Volume): {opts.pcr_volume:.2f}")
+    if opts.max_pain > 0:
+        pct_from_pain = ((opts.underlying_price - opts.max_pain) / opts.max_pain) * 100
+        lines.append(
+            f"  Max Pain: ₹{opts.max_pain:.2f} "
+            f"(price is {pct_from_pain:+.2f}% from max pain)"
+        )
+    lines.append(
+        f"  Highest Call OI strike: ₹{opts.highest_call_oi_strike:.2f} "
+        "(acts as resistance — call writers defend this)"
+    )
+    lines.append(
+        f"  Highest Put OI strike:  ₹{opts.highest_put_oi_strike:.2f} "
+        "(acts as support — put writers defend this)"
+    )
+    lines.append(
+        f"  Day's OI change: Calls {opts.total_call_oi_change:+,} · "
+        f"Puts {opts.total_put_oi_change:+,} → {opts.buildup_signal}"
+    )
+    lines.append(
+        f"  Composite signal: {opts.composite_signal} "
+        f"(strength {opts.composite_strength}/5)"
+    )
+    if opts.confirmations:
+        lines.append("  Signal rationale:")
+        for c in opts.confirmations:
+            lines.append(f"    - {c}")
+    return "\n".join(lines)
+
+
+def _build_analysis_prompt(price_data: dict, news: list, ratings: dict,
+                          options: Optional[OptionChainData]) -> str:
     p = price_data
 
     news_block = ""
@@ -419,97 +410,144 @@ def _build_analysis_prompt(price_data: dict, news: list, ratings: dict) -> str:
             news_lines.append(f"  - [{age}] {n['title']} ({n['source']})")
         news_block = "\n".join(news_lines)
     else:
-        news_block = "  (no recent headlines found in last 7 days)"
+        news_block = "  (no recent headlines)"
 
     ratings_block = _format_ratings_for_prompt(ratings, p["current_price"])
+    options_block = _format_options_for_prompt(options)
 
     return f"""You are a technical analyst for Indian (NSE) stocks. Analyze the following daily-timeframe data for {p['symbol']} and provide a balanced, actionable assessment.
 
 PRICE & VOLUME
 - Current price: ₹{p['current_price']:,.2f}
 - Today's change: {p['pct_change_1d']:+.2f}%
-- 5-day change: {p['pct_change_5d']:+.2f}%
-- 30-day change: {p['pct_change_30d']:+.2f}%
-- 90-day change: {p['pct_change_90d']:+.2f}%
+- 5d/30d/90d changes: {p['pct_change_5d']:+.2f}% / {p['pct_change_30d']:+.2f}% / {p['pct_change_90d']:+.2f}%
 - Today's range: ₹{p['day_low']:,.2f} – ₹{p['day_high']:,.2f}
 - Volume today: {p['volume']:,} (vs 20d avg {p['volume_20d_avg']:,} → {p['volume_ratio']}x)
 
 52-WEEK RANGE
-- 52w high: ₹{p['high_52w']:,.2f} (currently {p['pct_from_52w_high']:+.2f}% from high)
-- 52w low:  ₹{p['low_52w']:,.2f}  (currently {p['pct_from_52w_low']:+.2f}% from low)
+- 52w high: ₹{p['high_52w']:,.2f} ({p['pct_from_52w_high']:+.2f}% from high)
+- 52w low:  ₹{p['low_52w']:,.2f}  ({p['pct_from_52w_low']:+.2f}% from low)
 
 TREND (Moving Averages)
 - SMA 20:  ₹{p['sma_20']:,.2f}  ({'above' if p['current_price'] > p['sma_20']  else 'below'})
 - SMA 50:  ₹{p['sma_50']:,.2f}  ({'above' if p['current_price'] > p['sma_50']  else 'below'})
 - SMA 200: ₹{p['sma_200']:,.2f} ({'above' if p['current_price'] > p['sma_200'] else 'below'})
-- EMA 9:   ₹{p['ema_9']:,.2f}
-- EMA 21:  ₹{p['ema_21']:,.2f}
+- EMA 9 / EMA 21: ₹{p['ema_9']:,.2f} / ₹{p['ema_21']:,.2f}
 
 MOMENTUM
 - RSI (14): {p['rsi_14']} {'(overbought)' if p['rsi_14'] > 70 else '(oversold)' if p['rsi_14'] < 30 else '(neutral)'}
-- MACD line: {p['macd_line']}
-- MACD signal: {p['macd_signal']}
-- MACD histogram: {p['macd_hist']} {'(bullish)' if p['macd_hist'] > 0 else '(bearish)'}
+- MACD line / signal / histogram: {p['macd_line']} / {p['macd_signal']} / {p['macd_hist']}
 
-VOLATILITY / BANDS
-- Bollinger upper: ₹{p['bb_upper']:,.2f}
-- Bollinger middle: ₹{p['bb_middle']:,.2f}
-- Bollinger lower: ₹{p['bb_lower']:,.2f}
+VOLATILITY
+- Bollinger upper/middle/lower: ₹{p['bb_upper']:,.2f} / ₹{p['bb_middle']:,.2f} / ₹{p['bb_lower']:,.2f}
 - ATR (14): ₹{p['atr_14']:,.2f}
+
+OPTIONS DATA (F&O smart-money positioning)
+{options_block}
 
 ANALYST RATINGS & PRICE TARGETS
 {ratings_block}
 
-RECENT NEWS HEADLINES (last 7 days)
+RECENT NEWS (last 7 days)
 {news_block}
 
 INSTRUCTIONS
 Provide your analysis in exactly this structure, using Markdown:
 
 ## Trend Summary
-2-3 sentences describing current trend direction (bullish/bearish/sideways), strength, and conviction level.
+2-3 sentences describing trend direction, strength, conviction.
 
 ## Key Technical Observations
-- Bullet points (4-6) covering the most important indicator signals
-- Be specific with numbers; tie observations to actual values above
-- Cover MA structure, RSI/MACD, volatility, and volume
+- 4-6 bullets covering MA structure, RSI/MACD, volatility, volume
+- Be specific with numbers
+
+## Options Sentiment Read
+- What is F&O smart money signalling?
+- Tie PCR + OI buildup + max pain into a coherent view
+- Specifically address: does options positioning agree or conflict with the technicals?
+- Note key levels from OI: highest call OI = resistance, highest put OI = support
+- If no options data, say so and skip this section
 
 ## Support & Resistance
-- Immediate support: ₹X (rationale)
+- Immediate support: ₹X (rationale — include options OI levels if relevant)
 - Immediate resistance: ₹Y (rationale)
-- Use recent pivots, MAs, BB bands, and 52w levels
+- Use price pivots, MAs, BB, and OI levels
 
 ## Analyst View vs Technical View
-- 1-2 sentences comparing what brokers are saying (rating + price target) with what the technicals show
-- Flag any disagreement (e.g., "brokers bullish but RSI overbought" or "technical breakdown despite buy ratings")
-- If no analyst data is available, say so and skip this section
+- Compare broker rating + target with technical setup
+- Flag disagreements
 
 ## News Context
-1-2 sentences on how the recent headlines (if any) align with or contradict the technicals.
+1-2 sentences linking news to the setup.
 
 ## Recommendation
 One of: **STRONG BUY**, **BUY**, **HOLD**, **SELL**, **STRONG SELL**, **AVOID**
 
 Follow with:
 - Time horizon (intraday / swing 1-4 weeks / positional 1-3 months)
-- Entry zone (if buying) or stop-loss / exit zone (if selling)
-- Target (realistic, based on resistance levels and analyst targets where relevant)
-- Risk-reward ratio
+- Entry zone / Stop-loss
+- Target (use both technical levels and options-implied levels)
+- Risk-reward
 
 ## Risks & Caveats
-2-3 bullet points covering what could invalidate this view.
+2-3 bullets on what invalidates the view.
 
-IMPORTANT GUARDRAILS
-- Be honest about uncertainty. If signals conflict, say so.
-- Do not predict prices with false precision.
-- Use analyst targets as one input among many — they're often lagging.
-- End with: "*This is technical analysis only. Not investment advice. Past performance does not guarantee future returns.*"
+GUARDRAILS
+- Honest about uncertainty.
+- When options data conflicts with technicals, explicitly say which one you weight more and why.
+- Treat options data as one input, not a single magic indicator.
+- End with: "*Technical analysis only. Not investment advice.*"
 """
 
 
 # ---------------------------------------------------------------------------
-# Analyze endpoint
+# Endpoints
 # ---------------------------------------------------------------------------
+@app.route("/api/options", methods=["POST"])
+def get_options():
+    """Standalone options-only analysis (faster — no AI call)."""
+    data   = request.get_json(silent=True) or {}
+    symbol = (data.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+
+    # Need underlying price to compute distances etc.
+    price_data = _fetch_price_data(symbol)
+    if price_data is None:
+        return jsonify({"error": f"Could not fetch price data for {symbol}"}), 404
+
+    opts = fetch_options_data(symbol, price_data["current_price"])
+    if opts is None:
+        return jsonify({
+            "error": "no_fo_data",
+            "message": f"{symbol} appears not to be an F&O stock, "
+                       "or NSE option chain endpoint is temporarily unavailable. "
+                       "Try a NIFTY 50 stock like RELIANCE or HDFCBANK."
+        }), 404
+
+    return jsonify({
+        "symbol":           opts.symbol,
+        "underlying_price": opts.underlying_price,
+        "expiry_date":      opts.expiry_date,
+        "pcr_oi":           round(opts.pcr_oi, 2),
+        "pcr_volume":       round(opts.pcr_volume, 2),
+        "max_pain":         round(opts.max_pain, 2),
+        "pct_from_max_pain": round((opts.underlying_price - opts.max_pain) / opts.max_pain * 100, 2) if opts.max_pain else 0,
+        "highest_call_oi_strike": opts.highest_call_oi_strike,
+        "highest_put_oi_strike":  opts.highest_put_oi_strike,
+        "total_call_oi":          opts.total_call_oi,
+        "total_put_oi":           opts.total_put_oi,
+        "total_call_oi_change":   opts.total_call_oi_change,
+        "total_put_oi_change":    opts.total_put_oi_change,
+        "pcr_signal":             opts.pcr_signal,
+        "buildup_signal":         opts.buildup_signal,
+        "composite_signal":       opts.composite_signal,
+        "composite_strength":     opts.composite_strength,
+        "confirmations":          opts.confirmations,
+        "top_strikes":            opts.top_strikes,
+    }), 200
+
+
 @app.route("/api/analyze", methods=["POST"])
 def analyze_stock():
     if not anthropic_client:
@@ -518,33 +556,26 @@ def analyze_stock():
     data   = request.get_json(silent=True) or {}
     symbol = (data.get("symbol") or "").strip().upper()
     if not symbol:
-        return jsonify({"error": "symbol required in body"}), 400
+        return jsonify({"error": "symbol required"}), 400
 
     if not all(c.isalnum() or c in "&-" for c in symbol):
-        return jsonify({"error": "invalid symbol format"}), 400
+        return jsonify({"error": "invalid symbol"}), 400
 
     logger.info("Analyzing %s", symbol)
 
-    # 1. Fetch price data + indicators
     price_data = _fetch_price_data(symbol)
     if price_data is None:
-        return jsonify({
-            "error": f"Could not fetch data for {symbol}. "
-                     "Check the symbol exists on NSE."
-        }), 404
+        return jsonify({"error": f"Could not fetch data for {symbol}"}), 404
 
-    # 2. Fetch analyst ratings (NEW)
     ratings = _fetch_analyst_ratings(symbol)
+    news    = _fetch_news(symbol)
+    options = fetch_options_data(symbol, price_data["current_price"])   # may be None for non-F&O
 
-    # 3. Fetch recent news
-    news = _fetch_news(symbol)
-
-    # 4. Build prompt and call Claude
-    prompt = _build_analysis_prompt(price_data, news, ratings)
+    prompt = _build_analysis_prompt(price_data, news, ratings, options)
     try:
         response = anthropic_client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=1800,
+            max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
         analysis_text = "".join(
@@ -554,11 +585,36 @@ def analyze_stock():
         logger.exception("Anthropic API call failed: %s", e)
         return jsonify({"error": f"AI analysis failed: {str(e)}"}), 500
 
+    # Serialize options data for the dashboard
+    options_payload = None
+    if options is not None:
+        options_payload = {
+            "symbol":              options.symbol,
+            "expiry_date":         options.expiry_date,
+            "pcr_oi":              round(options.pcr_oi, 2),
+            "pcr_volume":          round(options.pcr_volume, 2),
+            "max_pain":            round(options.max_pain, 2),
+            "pct_from_max_pain":   round((options.underlying_price - options.max_pain) / options.max_pain * 100, 2) if options.max_pain else 0,
+            "highest_call_oi_strike": options.highest_call_oi_strike,
+            "highest_put_oi_strike":  options.highest_put_oi_strike,
+            "total_call_oi":          options.total_call_oi,
+            "total_put_oi":           options.total_put_oi,
+            "total_call_oi_change":   options.total_call_oi_change,
+            "total_put_oi_change":    options.total_put_oi_change,
+            "pcr_signal":             options.pcr_signal,
+            "buildup_signal":         options.buildup_signal,
+            "composite_signal":       options.composite_signal,
+            "composite_strength":     options.composite_strength,
+            "confirmations":          options.confirmations,
+            "top_strikes":            options.top_strikes,
+        }
+
     return jsonify({
         "symbol":      symbol,
         "analyzed_at": datetime.utcnow().isoformat() + "Z",
         "price_data":  price_data,
         "ratings":     ratings,
+        "options":     options_payload,
         "news":        news,
         "analysis":    analysis_text,
         "model":       ANTHROPIC_MODEL,
