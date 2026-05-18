@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 UPSTOX_BASE_URL          = "https://api.upstox.com"
 INSTRUMENT_SEARCH_PATH   = "/v2/instruments/search"
 OPTION_CHAIN_PATH        = "/v2/option/chain"
+OPTION_CONTRACT_PATH     = "/v2/option/contract"   # lists available expiries
 
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "")
 
@@ -281,42 +282,118 @@ def fetch_option_chain(instrument_key: str, expiry_date: str) -> Optional[dict]:
         return None
 
 
+def list_available_expiries(instrument_key: str) -> list[str]:
+    """
+    List all available option expiry dates for a given underlying.
+
+    Uses Upstox's /v2/option/contract endpoint which returns every active
+    option contract for the instrument. We extract the unique expiry dates,
+    sort them ascending, and return as YYYY-MM-DD strings.
+
+    This is the authoritative source — it doesn't matter whether NSE
+    expiries are on Tuesday, Thursday, or any other day. Upstox tells us
+    directly which dates are valid.
+
+    Returns:
+      List of expiry date strings in YYYY-MM-DD format, sorted nearest first.
+      Empty list if the instrument has no F&O contracts.
+    """
+    try:
+        payload = _get_json(OPTION_CONTRACT_PATH, {
+            "instrument_key": instrument_key,
+        })
+    except UpstoxNotFoundError:
+        return []
+    except UpstoxError as e:
+        logger.warning("Option contracts fetch failed for %s: %s", instrument_key, e)
+        return []
+
+    contracts = payload.get("data") or []
+    if not contracts:
+        return []
+
+    # Each contract entry has an "expiry" field (Upstox returns either an
+    # ISO date string or a Unix-millis timestamp — handle both).
+    from datetime import date as _date, datetime as _datetime, timezone as _timezone
+
+    unique_expiries: set[str] = set()
+    for contract in contracts:
+        raw_expiry = contract.get("expiry")
+        if raw_expiry is None:
+            continue
+        # Normalize to YYYY-MM-DD
+        try:
+            if isinstance(raw_expiry, (int, float)):
+                # Unix millis — use timezone-aware datetime
+                dt = _datetime.fromtimestamp(raw_expiry / 1000, tz=_timezone.utc)
+                expiry_str = dt.strftime("%Y-%m-%d")
+            elif isinstance(raw_expiry, str):
+                # Either "YYYY-MM-DD" or full ISO; take first 10 chars
+                expiry_str = raw_expiry[:10]
+            else:
+                continue
+            unique_expiries.add(expiry_str)
+        except Exception as e:
+            logger.debug("Could not parse expiry %r: %s", raw_expiry, e)
+            continue
+
+    # Filter to future expiries and sort ascending
+    today = _date.today()
+    future_expiries = []
+    for s in unique_expiries:
+        try:
+            expiry_date = _datetime.strptime(s, "%Y-%m-%d").date()
+            if expiry_date >= today:
+                future_expiries.append(s)
+        except ValueError:
+            continue
+
+    future_expiries.sort()
+    return future_expiries
+
+
 def get_nearest_expiry(instrument_key: str) -> Optional[str]:
     """
-    Find the nearest upcoming expiry date for a given instrument's options.
+    Find the nearest upcoming option expiry for an instrument.
 
-    Strategy: try the current month's last Thursday, then the next month's.
-    If neither works, walk forward week-by-week up to 6 weeks ahead.
+    Strategy (most reliable first):
+      1. Ask Upstox /v2/option/contract for the list of active expiries
+         and pick the nearest future one.
+      2. If that fails (older Upstox account / API hiccup), fall back to
+         day-by-day probing for the next 45 days. This handles any
+         expiry-day rule (NSE stock options moved from Thursday to
+         Tuesday in Sept 2025).
 
-    Returns the first expiry date (YYYY-MM-DD) that returns a valid option
-    chain, or None if no valid expiry found.
+    Returns:
+      Expiry date as YYYY-MM-DD, or None if nothing valid found.
     """
+    # Strategy 1 — authoritative list from Upstox
+    expiries = list_available_expiries(instrument_key)
+    if expiries:
+        nearest = expiries[0]
+        logger.info("Resolved nearest expiry for %s: %s (from %d available)",
+                    instrument_key, nearest, len(expiries))
+        return nearest
+
+    logger.info("Contracts endpoint returned no expiries for %s — falling back to day probing",
+                instrument_key)
+
+    # Strategy 2 — probe every weekday for the next 45 days
+    # Covers Mon-Fri (skips weekends since exchange is closed) and works
+    # regardless of whether expiries are on Tuesday, Thursday, or another day.
     from datetime import date, timedelta
 
     today = date.today()
-    candidates: list[str] = []
-
-    # Walk forward in weekly steps for ~6 weeks. NSE monthly expiries are
-    # always the last Thursday of the month, but weekly expiries (Nifty/
-    # Bank Nifty) are every Thursday. For stock options we mainly want
-    # monthly, so we try Thursdays for the next 6 weeks.
-    for week_offset in range(6):
-        target = today + timedelta(days=week_offset * 7)
-        # Find the next Thursday (weekday() == 3)
-        days_to_thursday = (3 - target.weekday()) % 7
-        thursday = target + timedelta(days=days_to_thursday)
-        if thursday < today:
+    for day_offset in range(1, 46):
+        target = today + timedelta(days=day_offset)
+        if target.weekday() >= 5:   # 5 = Saturday, 6 = Sunday
             continue
-        candidate = thursday.strftime("%Y-%m-%d")
-        if candidate not in candidates:
-            candidates.append(candidate)
-
-    # Try each candidate — first one that returns data wins
-    for expiry_str in candidates:
+        expiry_str = target.strftime("%Y-%m-%d")
         payload = fetch_option_chain(instrument_key, expiry_str)
         if payload and payload.get("data"):
-            logger.info("Resolved nearest expiry for %s: %s", instrument_key, expiry_str)
+            logger.info("Resolved nearest expiry via probing for %s: %s",
+                        instrument_key, expiry_str)
             return expiry_str
 
-    logger.warning("No valid expiry found for %s in next 6 weeks", instrument_key)
+    logger.warning("No valid expiry found for %s in next 45 days", instrument_key)
     return None
