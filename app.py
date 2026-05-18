@@ -1,6 +1,7 @@
 """
 NSE Dashboard API — read-only JSON for the Cloudflare Pages dashboard,
-plus on-demand stock analysis with Anthropic Claude and options analysis.
+plus on-demand stock analysis with Anthropic Claude, options analysis (Upstox),
+and analyst ratings with Postgres caching.
 
 Endpoints:
   GET  /              → health check
@@ -26,6 +27,7 @@ from anthropic import Anthropic
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+from analyst_cache import get_cached, save_cache
 from options_analyzer import OptionChainData, fetch_options_data
 from technical_indicators import atr, bollinger_bands, ema, macd, rsi, sma
 
@@ -44,6 +46,9 @@ if ANTHROPIC_API_KEY:
     anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
+# ---------------------------------------------------------------------------
+# Postgres helpers
+# ---------------------------------------------------------------------------
 @contextmanager
 def _conn():
     if not DATABASE_URL:
@@ -56,7 +61,7 @@ def _conn():
 
 
 # ---------------------------------------------------------------------------
-# Health + snapshot (unchanged)
+# Health + snapshot
 # ---------------------------------------------------------------------------
 @app.route("/")
 def health():
@@ -64,6 +69,7 @@ def health():
         "status": "ok",
         "service": "nse-dashboard-api",
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
+        "upstox_configured":    bool(os.getenv("UPSTOX_ACCESS_TOKEN", "")),
     }), 200
 
 
@@ -88,9 +94,10 @@ def get_snapshot():
 
 
 # ---------------------------------------------------------------------------
-# Price data + indicators (unchanged)
+# Price data + indicators
 # ---------------------------------------------------------------------------
 def _fetch_price_data(symbol: str) -> Optional[dict]:
+    """Fetch 6mo of daily data + compute all indicators for a stock."""
     yf_symbol = f"{symbol}.NS"
     try:
         ticker = yf.Ticker(yf_symbol)
@@ -174,10 +181,31 @@ def _fetch_price_data(symbol: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Analyst ratings (unchanged from your existing version)
+# Analyst ratings — now CACHE-AWARE
 # ---------------------------------------------------------------------------
 def _fetch_analyst_ratings(symbol: str) -> dict:
+    """
+    Fetch analyst recommendations and price targets.
+
+    Cache-first strategy:
+      1. Check Postgres cache — if fresh (<6h), return immediately
+      2. Otherwise, call yfinance
+      3. On success, save to cache and return fresh data
+      4. On rate-limit / failure, return empty result (cold-start behavior:
+         show 'no data' rather than ancient cached entries)
+    """
     yf_symbol = f"{symbol}.NS"
+    empty_result = {
+        "summary": None, "consensus": None, "price_target": None,
+        "recent_actions": [], "data_source": "unavailable",
+    }
+
+    # ---- Step 1: Try cache first ----
+    cached = get_cached(symbol)
+    if cached is not None:
+        return cached
+
+    # ---- Step 2: Cache miss → fetch from yfinance ----
     result = {
         "summary": None, "consensus": None, "price_target": None,
         "recent_actions": [], "data_source": "unavailable",
@@ -267,13 +295,19 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
             result["data_source"] = "yfinance"
 
     except Exception as e:
+        # Most common case: Yahoo "Too Many Requests" rate limit
+        # Return empty result; do NOT save to cache (so next request retries)
         logger.warning("Analyst rating fetch failed for %s: %s", symbol, e)
+        return empty_result
+
+    # ---- Step 3: Save successful fetch to cache for next time ----
+    save_cache(symbol, result)
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# News (unchanged)
+# News
 # ---------------------------------------------------------------------------
 def _fetch_news(symbol: str, max_items: int = 6) -> list:
     query = urllib.parse.quote_plus(f'"{symbol}" India stock')
@@ -322,7 +356,7 @@ def _fetch_news(symbol: str, max_items: int = 6) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Prompt builders (with NEW options section)
+# Prompt builders
 # ---------------------------------------------------------------------------
 def _format_ratings_for_prompt(ratings: dict, current_price: float) -> str:
     if ratings.get("data_source") == "unavailable":
@@ -476,6 +510,7 @@ Provide your analysis in exactly this structure, using Markdown:
 ## Analyst View vs Technical View
 - Compare broker rating + target with technical setup
 - Flag disagreements
+- If no analyst data, say so and skip this section
 
 ## News Context
 1-2 sentences linking news to the setup.
@@ -511,7 +546,6 @@ def get_options():
     if not symbol:
         return jsonify({"error": "symbol required"}), 400
 
-    # Need underlying price to compute distances etc.
     price_data = _fetch_price_data(symbol)
     if price_data is None:
         return jsonify({"error": f"Could not fetch price data for {symbol}"}), 404
@@ -521,7 +555,7 @@ def get_options():
         return jsonify({
             "error": "no_fo_data",
             "message": f"{symbol} appears not to be an F&O stock, "
-                       "or NSE option chain endpoint is temporarily unavailable. "
+                       "or option chain data is temporarily unavailable. "
                        "Try a NIFTY 50 stock like RELIANCE or HDFCBANK."
         }), 404
 
