@@ -8,6 +8,7 @@ Endpoints:
   GET  /api/snapshot  → latest scanner snapshots
   POST /api/analyze   → full AI analysis (technicals + analyst + news + options)
   POST /api/options   → standalone options-only analysis
+  POST /api/compare   → side-by-side comparison of 2 stocks with AI verdict
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -651,6 +653,482 @@ def analyze_stock():
         "options":     options_payload,
         "news":        news,
         "analysis":    analysis_text,
+        "model":       ANTHROPIC_MODEL,
+    }), 200
+
+
+# ===========================================================================
+# COMPARISON FEATURE — side-by-side comparison of 2 stocks
+# ===========================================================================
+
+def _fetch_stock_bundle(symbol: str) -> dict:
+    """
+    Fetch everything needed to compare ONE stock.
+
+    Runs price first (options analyzer needs current price), then fans out
+    to fetch analyst ratings, options data, and news in parallel.
+    Returns a dict with keys: symbol, price, ratings, options, news.
+    """
+    bundle = {"symbol": symbol, "price": None, "ratings": None,
+              "options": None, "news": []}
+
+    bundle["price"] = _fetch_price_data(symbol)
+    if bundle["price"] is None:
+        return bundle  # caller checks for this and 404s
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_ratings = executor.submit(_fetch_analyst_ratings, symbol)
+        future_options = executor.submit(
+            fetch_options_data, symbol, bundle["price"]["current_price"]
+        )
+        future_news    = executor.submit(_fetch_news, symbol, 3)
+
+        bundle["ratings"] = future_ratings.result()
+        bundle["options"] = future_options.result()
+        bundle["news"]    = future_news.result()
+
+    return bundle
+
+
+def _compute_comparison_metrics(a: dict, b: dict) -> dict:
+    """
+    Build the metric-by-metric comparison table + composite scores.
+    Each row has a winner: 'a', 'b', 'tie', or 'na' (not applicable).
+    """
+    rows = []
+    pa = a.get("price")
+    pb = b.get("price")
+    ra = a.get("ratings") or {}
+    rb = b.get("ratings") or {}
+    oa = a.get("options")
+    ob = b.get("options")
+
+    def add_row(section, metric, a_val, b_val, a_disp, b_disp, winner, reason=""):
+        rows.append({
+            "section": section, "metric": metric,
+            "a_value": a_val, "b_value": b_val,
+            "a_display": a_disp, "b_display": b_disp,
+            "winner": winner, "reason": reason,
+        })
+
+    # ---- Section 1: Price & Momentum ----
+    if pa and pb:
+        a_1d, b_1d = pa["pct_change_1d"], pb["pct_change_1d"]
+        add_row("Price & Momentum", "Today's change",
+                a_1d, b_1d, f"{a_1d:+.2f}%", f"{b_1d:+.2f}%",
+                "a" if a_1d > b_1d else "b" if b_1d > a_1d else "tie",
+                "Larger same-day gain favours stronger momentum")
+
+        a_30d, b_30d = pa["pct_change_30d"], pb["pct_change_30d"]
+        add_row("Price & Momentum", "30-day return",
+                a_30d, b_30d, f"{a_30d:+.2f}%", f"{b_30d:+.2f}%",
+                "a" if a_30d > b_30d else "b" if b_30d > a_30d else "tie",
+                "30-day return shows monthly trend strength")
+
+        a_90d, b_90d = pa["pct_change_90d"], pb["pct_change_90d"]
+        add_row("Price & Momentum", "90-day return",
+                a_90d, b_90d, f"{a_90d:+.2f}%", f"{b_90d:+.2f}%",
+                "a" if a_90d > b_90d else "b" if b_90d > a_90d else "tie",
+                "Quarter-trend strength")
+
+        a_vol, b_vol = pa["volume_ratio"], pb["volume_ratio"]
+        add_row("Price & Momentum", "Volume vs 20d avg",
+                a_vol, b_vol, f"{a_vol:.2f}x", f"{b_vol:.2f}x",
+                "a" if a_vol > b_vol else "b" if b_vol > a_vol else "tie",
+                "Higher volume = more institutional interest")
+
+        # Position in 52w range — closer to high = stronger trend
+        if pa["high_52w"] > pa["low_52w"]:
+            a_pos = (pa["current_price"] - pa["low_52w"]) / (pa["high_52w"] - pa["low_52w"]) * 100
+        else:
+            a_pos = 50
+        if pb["high_52w"] > pb["low_52w"]:
+            b_pos = (pb["current_price"] - pb["low_52w"]) / (pb["high_52w"] - pb["low_52w"]) * 100
+        else:
+            b_pos = 50
+        add_row("Price & Momentum", "Position in 52w range",
+                round(a_pos, 1), round(b_pos, 1),
+                f"{a_pos:.1f}% from low", f"{b_pos:.1f}% from low",
+                "a" if a_pos > b_pos else "b" if b_pos > a_pos else "tie",
+                "Stocks near 52w high show stronger uptrends")
+
+    # ---- Section 2: Trend Indicators ----
+    if pa and pb:
+        # RSI quality: 50-65 is ideal, >75 or <30 is poor
+        def rsi_quality(rsi):
+            if 50 <= rsi <= 65: return 3
+            if 40 <= rsi <= 50 or 65 < rsi <= 70: return 2
+            if 30 <= rsi < 40 or 70 < rsi <= 75: return 1
+            return 0
+
+        a_rsi, b_rsi = pa["rsi_14"], pb["rsi_14"]
+        a_rsi_q, b_rsi_q = rsi_quality(a_rsi), rsi_quality(b_rsi)
+        a_rsi_label = "overbought" if a_rsi > 70 else "oversold" if a_rsi < 30 else "neutral"
+        b_rsi_label = "overbought" if b_rsi > 70 else "oversold" if b_rsi < 30 else "neutral"
+        add_row("Trend Indicators", "RSI (14)",
+                a_rsi, b_rsi,
+                f"{a_rsi} ({a_rsi_label})", f"{b_rsi} ({b_rsi_label})",
+                "a" if a_rsi_q > b_rsi_q else "b" if b_rsi_q > a_rsi_q else "tie",
+                "RSI in 50-65 zone = bullish but not overbought")
+
+        def ma_count(p):
+            return sum([p["current_price"] > p["sma_20"],
+                        p["current_price"] > p["sma_50"],
+                        p["current_price"] > p["sma_200"]])
+        a_ma, b_ma = ma_count(pa), ma_count(pb)
+        add_row("Trend Indicators", "Above MAs (20/50/200)",
+                a_ma, b_ma, f"{a_ma}/3", f"{b_ma}/3",
+                "a" if a_ma > b_ma else "b" if b_ma > a_ma else "tie",
+                "More MAs below price = stronger uptrend")
+
+        a_macd, b_macd = pa["macd_hist"], pb["macd_hist"]
+        add_row("Trend Indicators", "MACD histogram",
+                a_macd, b_macd,
+                f"{a_macd:+.3f} ({'bullish' if a_macd > 0 else 'bearish'})",
+                f"{b_macd:+.3f} ({'bullish' if b_macd > 0 else 'bearish'})",
+                "a" if a_macd > b_macd else "b" if b_macd > a_macd else "tie",
+                "Positive MACD histogram = upward momentum")
+
+    # ---- Section 3: Options Sentiment ----
+    if oa and ob:
+        a_pcr, b_pcr = oa.pcr_oi, ob.pcr_oi
+        add_row("Options Sentiment", "PCR (OI)",
+                a_pcr, b_pcr,
+                f"{a_pcr:.2f} ({oa.pcr_signal})",
+                f"{b_pcr:.2f} ({ob.pcr_signal})",
+                "a" if a_pcr > b_pcr else "b" if b_pcr > a_pcr else "tie",
+                "Higher PCR = more put writing = bullish signal")
+
+        def signal_score(signal: str, strength: int) -> int:
+            s = signal.lower()
+            if "strong bullish" in s:    return strength
+            if "bullish" in s:           return max(strength - 1, 1)
+            if "slightly bullish" in s:  return max(strength - 2, 1)
+            if "strong bearish" in s:    return -strength
+            if "bearish" in s:           return -max(strength - 1, 1)
+            if "slightly bearish" in s:  return -max(strength - 2, 1)
+            return 0
+
+        a_sig = signal_score(oa.composite_signal, oa.composite_strength)
+        b_sig = signal_score(ob.composite_signal, ob.composite_strength)
+        add_row("Options Sentiment", "Composite signal",
+                a_sig, b_sig,
+                f"{oa.composite_signal} ({oa.composite_strength}/5)",
+                f"{ob.composite_signal} ({ob.composite_strength}/5)",
+                "a" if a_sig > b_sig else "b" if b_sig > a_sig else "tie",
+                "Composite blends PCR + OI buildup + max pain")
+
+        if oa.max_pain > 0 and ob.max_pain > 0:
+            a_mp = (oa.underlying_price - oa.max_pain) / oa.max_pain * 100
+            b_mp = (ob.underlying_price - ob.max_pain) / ob.max_pain * 100
+            add_row("Options Sentiment", "% from max pain",
+                    round(a_mp, 2), round(b_mp, 2),
+                    f"{a_mp:+.2f}%", f"{b_mp:+.2f}%",
+                    "a" if a_mp < b_mp else "b" if b_mp < a_mp else "tie",
+                    "Price below max pain = pull-up bias")
+    elif oa or ob:
+        add_row("Options Sentiment", "F&O availability",
+                bool(oa), bool(ob),
+                "F&O available" if oa else "Not an F&O stock",
+                "F&O available" if ob else "Not an F&O stock",
+                "a" if oa and not ob else "b" if ob and not oa else "tie",
+                "F&O stocks have more liquidity and signal quality")
+    else:
+        add_row("Options Sentiment", "F&O availability",
+                False, False,
+                "Not an F&O stock", "Not an F&O stock",
+                "na", "Neither stock has options data")
+
+    # ---- Section 4: Analyst Ratings ----
+    if ra.get("data_source") == "yfinance" or rb.get("data_source") == "yfinance":
+        def consensus_score(consensus):
+            if not consensus: return 0
+            c = consensus.lower()
+            if "strong buy" in c:   return 3
+            if "buy" in c:          return 2
+            if "outperform" in c:   return 2
+            if "hold" in c:         return 1
+            if "underperform" in c: return -1
+            if "strong sell" in c:  return -2
+            if "sell" in c:         return -1
+            return 0
+
+        a_cons = consensus_score(ra.get("consensus"))
+        b_cons = consensus_score(rb.get("consensus"))
+        add_row("Analyst Ratings", "Consensus",
+                a_cons, b_cons,
+                ra.get("consensus") or "No data",
+                rb.get("consensus") or "No data",
+                "a" if a_cons > b_cons else "b" if b_cons > a_cons else (
+                    "na" if a_cons == 0 and b_cons == 0 else "tie"),
+                "Higher conviction rating from analysts")
+
+        pt_a = (ra.get("price_target") or {}).get("mean")
+        pt_b = (rb.get("price_target") or {}).get("mean")
+        a_up = (pt_a - pa["current_price"]) / pa["current_price"] * 100 if (pt_a and pa) else None
+        b_up = (pt_b - pb["current_price"]) / pb["current_price"] * 100 if (pt_b and pb) else None
+
+        if a_up is not None or b_up is not None:
+            add_row("Analyst Ratings", "Upside to target",
+                    a_up if a_up is not None else 0,
+                    b_up if b_up is not None else 0,
+                    f"{a_up:+.1f}%" if a_up is not None else "No target",
+                    f"{b_up:+.1f}%" if b_up is not None else "No target",
+                    "a" if (a_up is not None and (b_up is None or a_up > b_up)) else
+                    "b" if (b_up is not None and (a_up is None or b_up > a_up)) else "tie",
+                    "Higher implied upside from broker price targets")
+
+        n_a = ((ra.get("price_target") or {}).get("count") or
+               (ra.get("summary") or {}).get("total") or 0)
+        n_b = ((rb.get("price_target") or {}).get("count") or
+               (rb.get("summary") or {}).get("total") or 0)
+        add_row("Analyst Ratings", "# Analysts covering",
+                n_a, n_b,
+                f"{n_a} analysts" if n_a else "No coverage",
+                f"{n_b} analysts" if n_b else "No coverage",
+                "a" if n_a > n_b else "b" if n_b > n_a else "tie",
+                "Broader coverage = more reliable consensus")
+    else:
+        add_row("Analyst Ratings", "Analyst data",
+                False, False,
+                "No coverage", "No coverage",
+                "na", "Yahoo Finance has no analyst data for either")
+
+    # ---- Section 5: Recent News (informational only) ----
+    a_news = a.get("news") or []
+    b_news = b.get("news") or []
+    add_row("Recent News", "Headlines (last 7 days)",
+            len(a_news), len(b_news),
+            f"{len(a_news)} headlines", f"{len(b_news)} headlines",
+            "na", "News headlines listed below for context")
+
+    # ---- Composite scores ----
+    scores = {"a": 0, "b": 0, "ties": 0, "na": 0}
+    for row in rows:
+        if   row["winner"] == "a":   scores["a"]    += 1
+        elif row["winner"] == "b":   scores["b"]    += 1
+        elif row["winner"] == "tie": scores["ties"] += 1
+        else:                        scores["na"]   += 1
+
+    verdict = "a" if scores["a"] > scores["b"] else "b" if scores["b"] > scores["a"] else "tie"
+
+    return {"rows": rows, "scores": scores, "verdict": verdict}
+
+
+def _build_comparison_prompt(a: dict, b: dict, metrics: dict) -> str:
+    """Build Claude prompt asking for executive summary + case-for-each + verdict."""
+    sym_a = a["symbol"]
+    sym_b = b["symbol"]
+    pa = a.get("price") or {}
+    pb = b.get("price") or {}
+    ra = a.get("ratings") or {}
+    rb = b.get("ratings") or {}
+    oa = a.get("options")
+    ob = b.get("options")
+
+    # Compact metric comparison table
+    table_lines = []
+    current_section = ""
+    for row in metrics["rows"]:
+        if row["section"] != current_section:
+            table_lines.append(f"\n  [{row['section']}]")
+            current_section = row["section"]
+        winner_marker = ""
+        if   row["winner"] == "a":   winner_marker = f" → {sym_a} wins"
+        elif row["winner"] == "b":   winner_marker = f" → {sym_b} wins"
+        elif row["winner"] == "tie": winner_marker = " → tie"
+        table_lines.append(
+            f"    {row['metric']}: "
+            f"{sym_a}={row['a_display']} | {sym_b}={row['b_display']}"
+            f"{winner_marker}"
+        )
+    table_block = "\n".join(table_lines)
+
+    def fmt_news(news):
+        if not news: return "    (no headlines)"
+        return "\n".join(
+            f"    - [{n['age_days']}d ago] {n['title']}" for n in news[:3]
+        )
+
+    def options_snippet(opts):
+        if opts is None:
+            return "    (not an F&O stock or data unavailable)"
+        return (f"    PCR(OI)={opts.pcr_oi:.2f} ({opts.pcr_signal}), "
+                f"Max Pain=₹{opts.max_pain:.0f}, "
+                f"Composite={opts.composite_signal} {opts.composite_strength}/5, "
+                f"Buildup={opts.buildup_signal}")
+
+    def analyst_snippet(ratings, price):
+        if ratings.get("data_source") == "unavailable":
+            return "    (no analyst data)"
+        consensus = ratings.get("consensus", "—")
+        pt = ratings.get("price_target") or {}
+        target = pt.get("mean")
+        if target and price:
+            upside = (target - price) / price * 100
+            return f"    Consensus={consensus}, Target=₹{target:,.0f} ({upside:+.1f}%)"
+        return f"    Consensus={consensus}"
+
+    s = metrics["scores"]
+    score_summary = (f"{sym_a} won {s['a']} metrics, {sym_b} won {s['b']}, "
+                     f"{s['ties']} tied, {s['na']} not applicable")
+
+    return f"""You are a sell-side equity analyst comparing TWO Indian (NSE) stocks for an Indian retail trader deciding which one to buy. Both stocks may be reasonable holdings; your job is to identify the stronger near-term opportunity (1-4 weeks swing horizon).
+
+STOCK A: {sym_a}
+  Current price: ₹{pa.get('current_price', 0):,.2f} ({pa.get('pct_change_1d', 0):+.2f}% today)
+  Position: {pa.get('pct_from_52w_high', 0):+.1f}% from 52w high, {pa.get('pct_from_52w_low', 0):+.1f}% from 52w low
+  Returns: 30d {pa.get('pct_change_30d', 0):+.2f}%, 90d {pa.get('pct_change_90d', 0):+.2f}%
+  RSI: {pa.get('rsi_14', 0)} | MACD hist: {pa.get('macd_hist', 0):+.3f} | Volume: {pa.get('volume_ratio', 0)}x avg
+  Options:
+{options_snippet(oa)}
+  Analyst:
+{analyst_snippet(ra, pa.get('current_price'))}
+  Recent news:
+{fmt_news(a.get('news'))}
+
+STOCK B: {sym_b}
+  Current price: ₹{pb.get('current_price', 0):,.2f} ({pb.get('pct_change_1d', 0):+.2f}% today)
+  Position: {pb.get('pct_from_52w_high', 0):+.1f}% from 52w high, {pb.get('pct_from_52w_low', 0):+.1f}% from 52w low
+  Returns: 30d {pb.get('pct_change_30d', 0):+.2f}%, 90d {pb.get('pct_change_90d', 0):+.2f}%
+  RSI: {pb.get('rsi_14', 0)} | MACD hist: {pb.get('macd_hist', 0):+.3f} | Volume: {pb.get('volume_ratio', 0)}x avg
+  Options:
+{options_snippet(ob)}
+  Analyst:
+{analyst_snippet(rb, pb.get('current_price'))}
+  Recent news:
+{fmt_news(b.get('news'))}
+
+METRIC-BY-METRIC COMPARISON
+{table_block}
+
+SCORE SUMMARY: {score_summary}
+
+INSTRUCTIONS
+Write your verdict in this exact Markdown structure:
+
+## Executive Summary
+2-3 sentences capturing the core difference between the two setups and which one looks more compelling right now.
+
+## The Case for {sym_a}
+3-4 bullets covering the strongest reasons to pick {sym_a}. Be specific with the numbers.
+
+## The Case for {sym_b}
+3-4 bullets covering the strongest reasons to pick {sym_b}. Be specific with the numbers.
+
+## Risk Factors
+- For {sym_a}: 1-2 specific risks
+- For {sym_b}: 1-2 specific risks
+
+## Verdict
+
+**BETTER BUY**: {sym_a} OR {sym_b} (pick one — be decisive)
+
+OR if neither is compelling right now:
+
+**BETTER AVOID**: both — wait for better setup
+
+Then provide:
+- Confidence: Low / Medium / High
+- Suggested time horizon
+- If allocating capital to BOTH: suggested split (e.g. "70% / 30%") with reasoning
+- Or rationale for going 100% on one
+
+## Caveats
+2-3 bullets noting what could invalidate this view.
+
+GUARDRAILS
+- Don't be wishy-washy. Pick a winner unless both are genuinely poor.
+- Use specific numbers from the data above. Don't speak in generalities.
+- When two metrics conflict, explicitly say which one you weight more and why.
+- End with: "*Comparative technical analysis only. Not investment advice.*"
+"""
+
+
+@app.route("/api/compare", methods=["POST"])
+def compare_stocks():
+    """
+    Compare 2 NSE stocks side-by-side.
+    Request body: {"symbols": ["RELIANCE", "HDFCBANK"]}
+    """
+    if not anthropic_client:
+        return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
+
+    data = request.get_json(silent=True) or {}
+    symbols = data.get("symbols") or []
+    if not isinstance(symbols, list) or len(symbols) != 2:
+        return jsonify({"error": "Provide exactly 2 symbols in 'symbols' array"}), 400
+
+    symbols = [s.strip().upper() for s in symbols if s]
+    if len(symbols) != 2:
+        return jsonify({"error": "Empty symbols not allowed"}), 400
+    if symbols[0] == symbols[1]:
+        return jsonify({"error": "Cannot compare a stock to itself"}), 400
+
+    for sym in symbols:
+        if not all(c.isalnum() or c in "&-" for c in sym):
+            return jsonify({"error": f"Invalid symbol format: {sym}"}), 400
+
+    logger.info("Comparing %s vs %s", symbols[0], symbols[1])
+
+    # Fetch both bundles in parallel — each bundle itself fans out
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_a = executor.submit(_fetch_stock_bundle, symbols[0])
+        future_b = executor.submit(_fetch_stock_bundle, symbols[1])
+        bundle_a = future_a.result()
+        bundle_b = future_b.result()
+
+    if bundle_a["price"] is None:
+        return jsonify({"error": f"Could not fetch data for {symbols[0]}"}), 404
+    if bundle_b["price"] is None:
+        return jsonify({"error": f"Could not fetch data for {symbols[1]}"}), 404
+
+    metrics = _compute_comparison_metrics(bundle_a, bundle_b)
+
+    prompt = _build_comparison_prompt(bundle_a, bundle_b, metrics)
+    try:
+        response = anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        verdict_text = "".join(
+            block.text for block in response.content if hasattr(block, "text")
+        )
+    except Exception as e:
+        logger.exception("Comparison AI call failed: %s", e)
+        return jsonify({"error": f"AI comparison failed: {str(e)}"}), 500
+
+    # Convert OptionChainData dataclass → dict for JSON serialization
+    def serialize_bundle(bundle):
+        b = dict(bundle)
+        if b.get("options") is not None:
+            o = b["options"]
+            b["options"] = {
+                "expiry_date":             o.expiry_date,
+                "pcr_oi":                  round(o.pcr_oi, 2),
+                "pcr_volume":              round(o.pcr_volume, 2),
+                "max_pain":                round(o.max_pain, 2),
+                "pct_from_max_pain":       round((o.underlying_price - o.max_pain) / o.max_pain * 100, 2) if o.max_pain else 0,
+                "highest_call_oi_strike":  o.highest_call_oi_strike,
+                "highest_put_oi_strike":   o.highest_put_oi_strike,
+                "total_call_oi":           o.total_call_oi,
+                "total_put_oi":            o.total_put_oi,
+                "pcr_signal":              o.pcr_signal,
+                "buildup_signal":          o.buildup_signal,
+                "composite_signal":        o.composite_signal,
+                "composite_strength":      o.composite_strength,
+                "confirmations":           o.confirmations,
+            }
+        return b
+
+    return jsonify({
+        "symbols":     symbols,
+        "analyzed_at": datetime.utcnow().isoformat() + "Z",
+        "stock_a":     serialize_bundle(bundle_a),
+        "stock_b":     serialize_bundle(bundle_b),
+        "metrics":     metrics,
+        "verdict":     verdict_text,
         "model":       ANTHROPIC_MODEL,
     }), 200
 
