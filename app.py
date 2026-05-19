@@ -9,6 +9,7 @@ Endpoints:
   POST /api/analyze   → full AI analysis (technicals + analyst + news + options)
   POST /api/options   → standalone options-only analysis
   POST /api/compare   → side-by-side comparison of 2 stocks with AI verdict
+  POST /api/strategy  → AI-recommended options strategy with concrete legs + P/L
 """
 
 from __future__ import annotations
@@ -31,6 +32,10 @@ from flask_cors import CORS
 
 from analyst_cache import get_cached, save_cache
 from options_analyzer import OptionChainData, fetch_options_data
+from strategy_engine import (
+    StrategyContext, OptionStrike,
+    build_all_strategies, derive_outlook,
+)
 from technical_indicators import atr, bollinger_bands, ema, macd, rsi, sma
 
 logging.basicConfig(level=logging.INFO)
@@ -1130,6 +1135,281 @@ def compare_stocks():
         "metrics":     metrics,
         "verdict":     verdict_text,
         "model":       ANTHROPIC_MODEL,
+    }), 200
+
+
+# ===========================================================================
+# OPTIONS STRATEGY FEATURE — AI-recommended strategy with concrete legs + P/L
+# ===========================================================================
+
+# NSE F&O lot sizes (verify periodically at nseindia.com)
+NSE_LOT_SIZES = {
+    "RELIANCE": 250, "HDFCBANK": 550, "ICICIBANK": 700, "INFY": 400,
+    "TCS": 175, "SBIN": 1500, "BHARTIARTL": 475, "AXISBANK": 625,
+    "KOTAKBANK": 400, "LT": 300, "ITC": 1600, "HINDUNILVR": 300,
+    "BAJFINANCE": 125, "MARUTI": 50, "ASIANPAINT": 200, "HCLTECH": 350,
+    "WIPRO": 3000, "ULTRACEMCO": 100, "SUNPHARMA": 700, "NTPC": 1500,
+    "POWERGRID": 1900, "TITAN": 375, "M&M": 350, "TATAMOTORS": 1425,
+    "TATASTEEL": 5500, "ADANIENT": 300, "ADANIPORTS": 625, "BAJAJFINSV": 500,
+    "NESTLEIND": 250, "ONGC": 4850, "COALINDIA": 2700, "JSWSTEEL": 1350,
+    "GRASIM": 475, "INDUSINDBK": 900, "EICHERMOT": 175, "HEROMOTOCO": 300,
+    "BAJAJ-AUTO": 125, "BPCL": 1800, "CIPLA": 650, "DIVISLAB": 300,
+    "DRREDDY": 125, "BRITANNIA": 200, "TECHM": 600, "APOLLOHOSP": 125,
+    "TATACONSUM": 900, "HINDALCO": 2150, "VEDL": 3500, "UPL": 1300,
+    "GAIL": 6100, "IOC": 9750,
+}
+
+
+def _get_lot_size(symbol: str) -> int:
+    """F&O lot size; default 1 if unknown (caller may want to warn)."""
+    return NSE_LOT_SIZES.get(symbol.upper(), 1)
+
+
+def _build_strategy_prompt(symbol, price_data, options_data, ratings,
+                            ctx, outlook, top_pick, alternatives, top_8) -> str:
+    """Build Claude prompt asking for strategy explanation + execution plan."""
+
+    def fmt_legs(strat):
+        return "\n".join(
+            f"    {l.action} {l.quantity} {l.instrument}" +
+            (f" @ \u20b9{l.strike:.0f}" if l.strike else "") +
+            f" (premium \u20b9{l.premium:.2f})"
+            for l in strat.legs
+        )
+
+    def fmt_strat(strat):
+        max_p = f"\u20b9{strat.max_profit:,.0f}" if strat.max_profit is not None else "Unlimited"
+        max_l = f"\u20b9{strat.max_loss:,.0f}"   if strat.max_loss   is not None else "Unlimited"
+        be_str = " or ".join(f"\u20b9{b:.2f}" for b in strat.breakevens) if strat.breakevens else "N/A"
+        debit_label = "Net Debit" if strat.net_debit > 0 else "Net Credit"
+        debit_val = f"\u20b9{abs(strat.net_debit):,.0f}"
+        return (
+            f"  Strategy: {strat.name} (fit_score={strat.fit_score}/100)\n"
+            f"  Category: {strat.category}, Risk: {strat.risk_profile}, Bias: {strat.direction_bias}\n"
+            f"  Legs:\n{fmt_legs(strat)}\n"
+            f"  {debit_label}: {debit_val}\n"
+            f"  Max Profit: {max_p}\n"
+            f"  Max Loss: {max_l}\n"
+            f"  Breakeven(s): {be_str}\n"
+            f"  Capital required: \u20b9{strat.capital_required:,.0f}\n"
+            f"  Fit reason: {strat.fit_reason}"
+        )
+
+    alts_block = "\n\n".join(
+        f"ALTERNATIVE #{i+2}:\n{fmt_strat(a)}" for i, a in enumerate(alternatives)
+    ) if alternatives else "(no alternatives)"
+
+    top8_list = "\n".join(
+        f"  {i+1}. {r.name} (fit={r.fit_score}, bias={r.direction_bias})"
+        for i, r in enumerate(top_8)
+    )
+
+    opt_summary = (
+        f"PCR(OI)={options_data.pcr_oi:.2f} ({options_data.pcr_signal}), "
+        f"Max Pain=\u20b9{options_data.max_pain:.0f}, "
+        f"Composite={options_data.composite_signal} ({options_data.composite_strength}/5)"
+    )
+
+    pt = (ratings.get("price_target") or {}).get("mean")
+    analyst_summary = f"{ratings.get('consensus', 'No data')}"
+    if pt:
+        upside = (pt - ctx.spot_price) / ctx.spot_price * 100
+        analyst_summary += f", Target \u20b9{pt:.0f} ({upside:+.1f}%)"
+
+    return f"""You are an options trading advisor for a retail Indian (NSE) F&O trader. Based on the analysis below, explain the recommended options strategy.
+
+SYMBOL: {symbol}
+Spot Price: \u20b9{ctx.spot_price:,.2f}
+Lot Size: {ctx.lot_size}
+Days to Expiry: {ctx.days_to_expiry}
+Expiry Date: {options_data.expiry_date}
+
+MARKET OUTLOOK (derived from technicals + options + analyst)
+  Direction: {outlook['direction'].upper()} (bull_signals={outlook['bullish_signals']}, bear_signals={outlook['bearish_signals']})
+  Conviction: {outlook['conviction'].upper()}
+  IV Regime: {outlook['iv_regime'].upper()}
+
+TECHNICAL CONTEXT
+  Price vs SMA: 50={ctx.spot_price/(price_data.get('sma_50') or 1):.2f}x, 200={ctx.spot_price/(price_data.get('sma_200') or 1):.2f}x
+  RSI: {price_data.get('rsi_14', 50)} | MACD hist: {price_data.get('macd_hist', 0):+.3f}
+  Volume: {price_data.get('volume_ratio', 1):.2f}x avg
+  Returns: 30d {price_data.get('pct_change_30d', 0):+.2f}%, 90d {price_data.get('pct_change_90d', 0):+.2f}%
+
+OPTIONS POSITIONING
+  {opt_summary}
+
+ANALYST VIEW
+  {analyst_summary}
+
+\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+RECOMMENDED STRATEGY (highest fit score)
+{fmt_strat(top_pick)}
+
+{alts_block}
+\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+
+ALL STRATEGIES RANKED BY FIT (top 8):
+{top8_list}
+
+INSTRUCTIONS
+Write your analysis in this exact Markdown structure:
+
+## Why This Strategy
+
+3-4 sentences explaining why **{top_pick.name}** fits this setup. Reference the actual data — direction, conviction, IV regime — not generic descriptions.
+
+## How to Execute
+
+- **Entry**: When to enter (now vs wait for trigger)
+- **Strike rationale**: Why these specific strikes
+- **Position sizing**: Standard 1 lot or scaled
+- **Profit target**: Specific exit level (% of max or specific price)
+- **Stop / Adjustment**: When to cut or roll
+
+## Key Risks
+
+- 2-3 specific risks. Reference current numbers — IV crush, theta decay, gap risk, etc.
+
+## When to Consider Alternatives
+
+- **{alternatives[0].name if alternatives else 'N/A'}**: 1-line condition for when this is better
+- **{alternatives[1].name if len(alternatives) > 1 else 'N/A'}**: 1-line condition
+
+## Important Caveats
+
+- Option prices are last-traded, not live bid/ask. Real fills may differ 5-15%.
+- Greeks not computed; verify delta/theta/vega in your broker terminal.
+
+GUARDRAILS
+- Be concrete with prices and percentages.
+- If top fit_score < 50, explicitly note "no high-conviction setup right now."
+- End with: "*Strategy analysis based on snapshot data. Not investment advice. Verify live bid/ask before placing orders.*"
+"""
+
+
+@app.route("/api/strategy", methods=["POST"])
+def get_strategy():
+    """
+    Recommend options strategy for a symbol.
+    Request body: {"symbol": "RELIANCE"}
+    """
+    if not anthropic_client:
+        return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
+
+    data = request.get_json(silent=True) or {}
+    symbol = (data.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+
+    if not all(c.isalnum() or c in "&-" for c in symbol):
+        return jsonify({"error": "invalid symbol"}), 400
+
+    logger.info("Strategy analysis for %s", symbol)
+
+    # Fetch data
+    price_data = _fetch_price_data(symbol)
+    if price_data is None:
+        return jsonify({"error": f"Could not fetch price data for {symbol}"}), 404
+
+    spot = price_data["current_price"]
+    options_data = fetch_options_data(symbol, spot)
+    if options_data is None:
+        return jsonify({
+            "error": "no_fo_data",
+            "message": f"{symbol} is not in F&O segment or option chain unavailable. "
+                       "Strategy recommendations require F&O. Try RELIANCE, HDFCBANK, etc."
+        }), 404
+
+    ratings = _fetch_analyst_ratings(symbol)
+
+    # Convert option chain to StrategyContext format
+    strikes = []
+    for s in (options_data.top_strikes or []):
+        strikes.append(OptionStrike(
+            strike=s["strike"],
+            call_ltp=s.get("call_ltp", 0.0),
+            call_oi=s.get("call_oi", 0),
+            put_ltp=s.get("put_ltp", 0.0),
+            put_oi=s.get("put_oi", 0),
+            distance_from_spot=s.get("distance_from_spot", 0.0),
+        ))
+    strikes.sort(key=lambda s: s.strike)
+
+    if len(strikes) < 5:
+        return jsonify({
+            "error": "insufficient_strikes",
+            "message": f"Only {len(strikes)} strikes available — need 5+ for strategy analysis."
+        }), 404
+
+    outlook = derive_outlook(price_data, options_data, ratings)
+
+    try:
+        from datetime import datetime as dt
+        expiry_dt = dt.strptime(options_data.expiry_date, "%Y-%m-%d")
+        days_to_expiry = max((expiry_dt.date() - dt.now().date()).days, 1)
+    except Exception:
+        days_to_expiry = 7
+
+    target_price = (ratings.get("price_target") or {}).get("mean") or (spot * 1.05)
+    stop_price = price_data.get("sma_50") or (spot * 0.95)
+
+    ctx = StrategyContext(
+        symbol=symbol,
+        spot_price=spot,
+        lot_size=_get_lot_size(symbol),
+        strikes=strikes,
+        direction=outlook["direction"],
+        conviction=outlook["conviction"],
+        iv_regime=outlook["iv_regime"],
+        target_price=target_price,
+        stop_price=stop_price,
+        atr_14=price_data.get("atr_14", spot * 0.02),
+        days_to_expiry=days_to_expiry,
+    )
+
+    all_results = build_all_strategies(ctx)
+    if not all_results:
+        return jsonify({"error": "No applicable strategies for current chain data"}), 500
+
+    top_pick = all_results[0]
+    alternatives = all_results[1:3]
+
+    prompt = _build_strategy_prompt(symbol, price_data, options_data, ratings,
+                                     ctx, outlook, top_pick, alternatives,
+                                     all_results[:8])
+
+    try:
+        response = anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        ai_text = "".join(b.text for b in response.content if hasattr(b, "text"))
+    except Exception as e:
+        logger.exception("Strategy AI call failed: %s", e)
+        return jsonify({"error": f"AI strategy analysis failed: {str(e)}"}), 500
+
+    return jsonify({
+        "symbol": symbol,
+        "analyzed_at": datetime.utcnow().isoformat() + "Z",
+        "spot_price": spot,
+        "lot_size": ctx.lot_size,
+        "days_to_expiry": days_to_expiry,
+        "expiry_date": options_data.expiry_date,
+        "outlook": outlook,
+        "top_pick": top_pick.to_dict(),
+        "alternatives": [a.to_dict() for a in alternatives],
+        "all_results_summary": [
+            {
+                "name": r.name,
+                "fit_score": r.fit_score,
+                "direction_bias": r.direction_bias,
+                "risk_profile": r.risk_profile,
+            }
+            for r in all_results
+        ],
+        "ai_analysis": ai_text,
+        "model": ANTHROPIC_MODEL,
     }), 200
 
 
