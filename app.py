@@ -1322,17 +1322,86 @@ def get_strategy():
 
     ratings = _fetch_analyst_ratings(symbol)
 
-    # Convert option chain to StrategyContext format
+    # Convert option chain to StrategyContext format.
+    # IMPORTANT: top_strikes from options_analyzer doesn't include LTPs by default.
+    # We try multiple field names, then fall back to re-fetching the raw Upstox chain
+    # to populate LTPs. Without LTPs, all strategy builders return None.
     strikes = []
+    missing_ltp_count = 0
+
     for s in (options_data.top_strikes or []):
+        # Try every plausible field name for call/put LTP
+        call_ltp = (
+            s.get("call_ltp")
+            or s.get("call_last_price")
+            or s.get("callLastPrice")
+            or s.get("ce_ltp")
+            or 0.0
+        )
+        put_ltp = (
+            s.get("put_ltp")
+            or s.get("put_last_price")
+            or s.get("putLastPrice")
+            or s.get("pe_ltp")
+            or 0.0
+        )
+        if call_ltp == 0.0 or put_ltp == 0.0:
+            missing_ltp_count += 1
+
         strikes.append(OptionStrike(
             strike=s["strike"],
-            call_ltp=s.get("call_ltp", 0.0),
+            call_ltp=float(call_ltp),
             call_oi=s.get("call_oi", 0),
-            put_ltp=s.get("put_ltp", 0.0),
+            put_ltp=float(put_ltp),
             put_oi=s.get("put_oi", 0),
             distance_from_spot=s.get("distance_from_spot", 0.0),
         ))
+
+    # If most strikes are missing LTPs, fetch raw Upstox option chain directly
+    # to populate them. This is the canonical fix.
+    if missing_ltp_count >= len(strikes) * 0.5 and len(strikes) > 0:
+        logger.warning(
+            "Strategy: %d/%d strikes missing LTP from top_strikes; "
+            "fetching raw Upstox chain to populate premiums",
+            missing_ltp_count, len(strikes)
+        )
+        try:
+            from upstox_client import (
+                get_instrument_key, get_nearest_expiry, get_option_chain,
+            )
+            instrument_key = get_instrument_key(symbol)
+            if instrument_key:
+                expiry = get_nearest_expiry(instrument_key)
+                if expiry:
+                    raw_chain = get_option_chain(instrument_key, expiry)
+                    # raw_chain entries: each has strike_price, call_options.market_data.ltp, put_options.market_data.ltp
+                    chain_lookup = {}
+                    for entry in (raw_chain or []):
+                        sp = entry.get("strike_price")
+                        if sp is None:
+                            continue
+                        co_md = (entry.get("call_options") or {}).get("market_data") or {}
+                        po_md = (entry.get("put_options") or {}).get("market_data") or {}
+                        chain_lookup[float(sp)] = {
+                            "call_ltp": float(co_md.get("ltp") or 0.0),
+                            "put_ltp":  float(po_md.get("ltp") or 0.0),
+                        }
+                    # Backfill LTPs into our strikes list
+                    backfilled = 0
+                    for strike_obj in strikes:
+                        ltps = chain_lookup.get(strike_obj.strike)
+                        if ltps:
+                            if strike_obj.call_ltp == 0.0 and ltps["call_ltp"] > 0:
+                                strike_obj.call_ltp = ltps["call_ltp"]
+                                backfilled += 1
+                            if strike_obj.put_ltp == 0.0 and ltps["put_ltp"] > 0:
+                                strike_obj.put_ltp = ltps["put_ltp"]
+                    logger.info("Backfilled LTPs for %d legs", backfilled)
+        except ImportError:
+            logger.warning("upstox_client unavailable for LTP backfill")
+        except Exception as e:
+            logger.exception("LTP backfill failed: %s", e)
+
     strikes.sort(key=lambda s: s.strike)
 
     if len(strikes) < 5:
@@ -1340,6 +1409,19 @@ def get_strategy():
             "error": "insufficient_strikes",
             "message": f"Only {len(strikes)} strikes available — need 5+ for strategy analysis."
         }), 404
+
+    # Final sanity check — at least some strikes must have non-zero LTPs
+    strikes_with_premium = sum(1 for s in strikes if s.call_ltp > 0 or s.put_ltp > 0)
+    if strikes_with_premium < 3:
+        return jsonify({
+            "error": "missing_premiums",
+            "message": (
+                f"Option premiums (LTPs) not available in chain data. "
+                f"Only {strikes_with_premium} of {len(strikes)} strikes have premiums. "
+                f"This usually means options_analyzer.py doesn't include LTPs in top_strikes. "
+                f"Check the API logs and patch options_analyzer.py per the strategy_engine docs."
+            )
+        }), 500
 
     outlook = derive_outlook(price_data, options_data, ratings)
 
