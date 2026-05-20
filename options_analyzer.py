@@ -9,7 +9,9 @@ Computes the same metrics as before:
   - Put-Call Ratio (PCR) by OI
   - Max Pain price (strike where option writers benefit most)
   - OI Buildup analysis (long/short buildup, unwinding, covering)
-  - Top OI strikes (act as dynamic S/R)
+  - Top OI strikes (act as dynamic S/R) — now includes call_ltp + put_ltp
+    so the Strategy Advisor can price multi-leg strategies without
+    refetching the chain.
   - Composite directional signal (Strong Bullish ... Strong Bearish)
 
 Output dataclass `OptionChainData` is unchanged — keeps the Flask API,
@@ -72,7 +74,9 @@ class OptionChainData:
     composite_signal:   str = "Neutral"
     composite_strength: int = 0    # 0-5
 
-    # Top strikes table — list of dicts (same shape as before)
+    # Top strikes table — list of dicts.
+    # Each dict now includes call_ltp and put_ltp so the strategy engine
+    # can price spreads/straddles without refetching the option chain.
     top_strikes: list = field(default_factory=list)
 
     # Human-readable confirmations
@@ -82,19 +86,28 @@ class OptionChainData:
 # ---------------------------------------------------------------------------
 # Internal helpers — parse Upstox's option chain structure
 # ---------------------------------------------------------------------------
-def _extract_market_data(option_block: dict) -> tuple[int, int, int, int]:
+def _extract_market_data(option_block: dict) -> tuple[int, int, int, float, float]:
     """
-    Extract (OI, prev_OI, volume, close_price) from an option block.
+    Extract (OI, prev_OI, volume, close_price, ltp) from an option block.
 
     The Upstox response nests data under `market_data`:
-      { "market_data": { "oi": N, "prev_oi": M, "volume": V, "close_price": C } }
+      { "market_data": { "oi": N, "prev_oi": M, "volume": V,
+                         "close_price": C, "ltp": L } }
+
+    NOTE: We return `ltp` as a separate field. When market is closed, Upstox
+    populates `close_price` but `ltp` may be 0; we fall back to close_price
+    in that case so strategies always have a usable premium.
     """
     md = (option_block or {}).get("market_data") or {}
     oi          = int(md.get("oi", 0) or 0)
     prev_oi     = int(md.get("prev_oi", 0) or 0)
     volume      = int(md.get("volume", 0) or 0)
     close_price = float(md.get("close_price", 0) or 0)
-    return oi, prev_oi, volume, close_price
+    ltp         = float(md.get("ltp", 0) or 0)
+    # Fall back to close_price if LTP is zero (e.g., after-market hours)
+    if ltp <= 0 and close_price > 0:
+        ltp = close_price
+    return oi, prev_oi, volume, close_price, ltp
 
 
 def _compute_max_pain(rows: list) -> float:
@@ -108,8 +121,8 @@ def _compute_max_pain(rows: list) -> float:
     strikes_data = []
     for row in rows:
         strike  = row.get("strike_price")
-        call_oi, _, _, _ = _extract_market_data(row.get("call_options"))
-        put_oi,  _, _, _ = _extract_market_data(row.get("put_options"))
+        call_oi, _, _, _, _ = _extract_market_data(row.get("call_options"))
+        put_oi,  _, _, _, _ = _extract_market_data(row.get("put_options"))
         if strike is None:
             continue
         strikes_data.append((float(strike), call_oi, put_oi))
@@ -302,11 +315,16 @@ def fetch_options_data(symbol: str, underlying_price: float) -> Optional[OptionC
     highest_put_oi  = 0
 
     strike_summary = []
+    # Track LTP coverage for diagnostic logging — if most strikes have zero
+    # LTPs, the Strategy Advisor will produce no recommendations, so this
+    # log line is critical for debugging.
+    strikes_with_ltp = 0
+
     for row in near_atm:
         strike = float(row.get("strike_price", 0))
 
-        call_oi, call_prev_oi, call_volume, _ = _extract_market_data(row.get("call_options"))
-        put_oi,  put_prev_oi,  put_volume,  _ = _extract_market_data(row.get("put_options"))
+        call_oi, call_prev_oi, call_volume, _, call_ltp = _extract_market_data(row.get("call_options"))
+        put_oi,  put_prev_oi,  put_volume,  _, put_ltp  = _extract_market_data(row.get("put_options"))
 
         call_oi_change = call_oi - call_prev_oi
         put_oi_change  = put_oi  - put_prev_oi
@@ -325,6 +343,9 @@ def fetch_options_data(symbol: str, underlying_price: float) -> Optional[OptionC
             highest_put_oi             = put_oi
             data.highest_put_oi_strike = strike
 
+        if call_ltp > 0 or put_ltp > 0:
+            strikes_with_ltp += 1
+
         strike_summary.append({
             "strike":              strike,
             "call_oi":             call_oi,
@@ -333,7 +354,18 @@ def fetch_options_data(symbol: str, underlying_price: float) -> Optional[OptionC
             "put_oi_change":       put_oi_change,
             "total_oi":            call_oi + put_oi,
             "distance_from_spot":  strike - underlying_price,
+            # NEW: include LTPs so Strategy Advisor can price multi-leg
+            # strategies without refetching the chain. Defaults to 0.0 if
+            # Upstox doesn't expose it; downstream strategy builders check
+            # `if min(..., put_ltp) <= 0: return None` to skip unpriced legs.
+            "call_ltp":            call_ltp,
+            "put_ltp":             put_ltp,
         })
+
+    logger.info(
+        "Options chain parsed for %s: %d near-ATM strikes, %d with LTPs",
+        symbol, len(strike_summary), strikes_with_ltp
+    )
 
     # ---- PCR ----
     if data.total_call_oi > 0:
