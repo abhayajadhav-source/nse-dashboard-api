@@ -1358,49 +1358,123 @@ def get_strategy():
         ))
 
     # If most strikes are missing LTPs, fetch raw Upstox option chain directly
-    # to populate them. This is the canonical fix.
+    # via HTTP to populate them. We don't import from upstox_client because
+    # the function names there may not match — we just hit the API directly.
     if missing_ltp_count >= len(strikes) * 0.5 and len(strikes) > 0:
         logger.warning(
             "Strategy: %d/%d strikes missing LTP from top_strikes; "
             "fetching raw Upstox chain to populate premiums",
             missing_ltp_count, len(strikes)
         )
-        try:
-            from upstox_client import (
-                get_instrument_key, get_nearest_expiry, get_option_chain,
-            )
-            instrument_key = get_instrument_key(symbol)
-            if instrument_key:
-                expiry = get_nearest_expiry(instrument_key)
-                if expiry:
-                    raw_chain = get_option_chain(instrument_key, expiry)
-                    # raw_chain entries: each has strike_price, call_options.market_data.ltp, put_options.market_data.ltp
-                    chain_lookup = {}
-                    for entry in (raw_chain or []):
-                        sp = entry.get("strike_price")
-                        if sp is None:
-                            continue
-                        co_md = (entry.get("call_options") or {}).get("market_data") or {}
-                        po_md = (entry.get("put_options") or {}).get("market_data") or {}
-                        chain_lookup[float(sp)] = {
-                            "call_ltp": float(co_md.get("ltp") or 0.0),
-                            "put_ltp":  float(po_md.get("ltp") or 0.0),
-                        }
-                    # Backfill LTPs into our strikes list
-                    backfilled = 0
-                    for strike_obj in strikes:
-                        ltps = chain_lookup.get(strike_obj.strike)
-                        if ltps:
-                            if strike_obj.call_ltp == 0.0 and ltps["call_ltp"] > 0:
-                                strike_obj.call_ltp = ltps["call_ltp"]
-                                backfilled += 1
-                            if strike_obj.put_ltp == 0.0 and ltps["put_ltp"] > 0:
-                                strike_obj.put_ltp = ltps["put_ltp"]
-                    logger.info("Backfilled LTPs for %d legs", backfilled)
-        except ImportError:
-            logger.warning("upstox_client unavailable for LTP backfill")
-        except Exception as e:
-            logger.exception("LTP backfill failed: %s", e)
+        upstox_token = os.getenv("UPSTOX_ACCESS_TOKEN", "")
+        if not upstox_token:
+            logger.error("UPSTOX_ACCESS_TOKEN not set — cannot backfill LTPs")
+        else:
+            try:
+                import requests
+
+                headers = {
+                    "Authorization": f"Bearer {upstox_token}",
+                    "Accept": "application/json",
+                }
+
+                # Step 1: Look up instrument key for this NSE equity symbol
+                search_url = "https://api.upstox.com/v2/search/instruments"
+                search_resp = requests.get(
+                    search_url,
+                    params={"query": symbol, "exchange": "NSE_EQ"},
+                    headers=headers,
+                    timeout=10,
+                )
+                instrument_key = None
+                if search_resp.status_code == 200:
+                    results = (search_resp.json() or {}).get("data", []) or []
+                    for r in results:
+                        # Match exact symbol on NSE_EQ
+                        if (r.get("trading_symbol", "").upper() == symbol.upper()
+                                and r.get("exchange") == "NSE_EQ"):
+                            instrument_key = r.get("instrument_key")
+                            break
+                    if instrument_key is None and results:
+                        # Fall back to first result
+                        instrument_key = results[0].get("instrument_key")
+                else:
+                    logger.warning("Upstox instrument search HTTP %d", search_resp.status_code)
+
+                # Step 2: Get nearest expiry from option contract metadata
+                expiry = None
+                if instrument_key:
+                    contracts_url = "https://api.upstox.com/v2/option/contract"
+                    contracts_resp = requests.get(
+                        contracts_url,
+                        params={"instrument_key": instrument_key},
+                        headers=headers,
+                        timeout=10,
+                    )
+                    if contracts_resp.status_code == 200:
+                        contracts = (contracts_resp.json() or {}).get("data", []) or []
+                        # Collect unique expiry dates, pick the nearest future one
+                        from datetime import datetime as dt
+                        today = dt.now().date()
+                        expiries = sorted({c.get("expiry") for c in contracts if c.get("expiry")})
+                        for e in expiries:
+                            try:
+                                e_date = dt.strptime(e, "%Y-%m-%d").date()
+                                if e_date >= today:
+                                    expiry = e
+                                    break
+                            except Exception:
+                                continue
+                    else:
+                        logger.warning("Upstox option/contract HTTP %d", contracts_resp.status_code)
+
+                # Step 3: Fetch the option chain for the nearest expiry
+                if instrument_key and expiry:
+                    chain_url = "https://api.upstox.com/v2/option/chain"
+                    chain_resp = requests.get(
+                        chain_url,
+                        params={"instrument_key": instrument_key, "expiry_date": expiry},
+                        headers=headers,
+                        timeout=15,
+                    )
+                    if chain_resp.status_code == 200:
+                        chain_data = (chain_resp.json() or {}).get("data", []) or []
+                        # Build strike -> LTPs map
+                        chain_lookup = {}
+                        for entry in chain_data:
+                            sp = entry.get("strike_price")
+                            if sp is None:
+                                continue
+                            co_md = (entry.get("call_options") or {}).get("market_data") or {}
+                            po_md = (entry.get("put_options") or {}).get("market_data") or {}
+                            chain_lookup[float(sp)] = {
+                                "call_ltp": float(co_md.get("ltp") or 0.0),
+                                "put_ltp":  float(po_md.get("ltp") or 0.0),
+                            }
+                        # Backfill into our strikes list
+                        backfilled = 0
+                        for strike_obj in strikes:
+                            ltps = chain_lookup.get(strike_obj.strike)
+                            if ltps:
+                                if strike_obj.call_ltp == 0.0 and ltps["call_ltp"] > 0:
+                                    strike_obj.call_ltp = ltps["call_ltp"]
+                                    backfilled += 1
+                                if strike_obj.put_ltp == 0.0 and ltps["put_ltp"] > 0:
+                                    strike_obj.put_ltp = ltps["put_ltp"]
+                        logger.info(
+                            "Backfilled LTPs into %d strike legs from Upstox chain (%d entries available)",
+                            backfilled, len(chain_lookup)
+                        )
+                    else:
+                        logger.warning("Upstox option/chain HTTP %d: %s",
+                                       chain_resp.status_code, chain_resp.text[:200])
+                else:
+                    logger.error(
+                        "Could not resolve instrument_key=%s or expiry=%s for %s",
+                        instrument_key, expiry, symbol
+                    )
+            except Exception as e:
+                logger.exception("Upstox LTP backfill failed: %s", e)
 
     strikes.sort(key=lambda s: s.strike)
 
