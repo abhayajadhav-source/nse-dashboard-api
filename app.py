@@ -1736,7 +1736,7 @@ def get_position_insights():
     try:
         response = anthropic_client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=2500,
+            max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
         ai_text = "".join(
