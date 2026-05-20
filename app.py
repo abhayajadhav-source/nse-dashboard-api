@@ -10,6 +10,7 @@ Endpoints:
   POST /api/options   → standalone options-only analysis
   POST /api/compare   → side-by-side comparison of 2 stocks with AI verdict
   POST /api/strategy  → AI-recommended options strategy with concrete legs + P/L
+  POST /api/position  → AI guidance on an existing position (hold/exit/scale)
 """
 
 from __future__ import annotations
@@ -1428,6 +1429,350 @@ def get_strategy():
         ],
         "ai_analysis": ai_text,
         "model": ANTHROPIC_MODEL,
+    }), 200
+
+
+# ===========================================================================
+# POSITION INSIGHTS — AI-powered guidance for an existing trade
+# ===========================================================================
+#
+# Endpoint: POST /api/position
+# Body: { symbol, entry_price, direction ("long"|"short"), quantity }
+#
+# Reuses the same data-gathering as /api/analyze (price, options, ratings,
+# news) but reframes the AI prompt to be position-aware instead of generic.
+# Computes position-specific metrics (unrealized P&L, distance to key option
+# strikes, etc.) and asks Claude for hold/exit/scale guidance.
+# ===========================================================================
+
+def _compute_position_metrics(
+    entry_price: float,
+    direction: str,
+    quantity: int,
+    current_price: float,
+    options_data: Optional[OptionChainData],
+) -> dict:
+    """
+    Compute position-specific metrics.
+
+    Direction-aware: for shorts, P&L is reversed.
+    """
+    # Direction multiplier: +1 for long, -1 for short
+    dir_mult = 1 if direction == "long" else -1
+
+    price_move      = current_price - entry_price
+    pnl_per_unit    = price_move * dir_mult
+    unrealized_pnl  = pnl_per_unit * quantity
+    pnl_pct         = (pnl_per_unit / entry_price) * 100 if entry_price > 0 else 0
+    invested        = entry_price * quantity
+
+    # Where is the position relative to key option-derived levels?
+    nearest_resistance = None
+    nearest_support    = None
+    distance_to_max_pain = None
+    if options_data:
+        # Use highest OI strikes as default S/R
+        nearest_resistance = options_data.highest_call_oi_strike or None
+        nearest_support    = options_data.highest_put_oi_strike or None
+        if options_data.max_pain:
+            distance_to_max_pain = (
+                (current_price - options_data.max_pain) / options_data.max_pain * 100
+            )
+
+    return {
+        "entry_price":         entry_price,
+        "direction":           direction,
+        "quantity":            quantity,
+        "current_price":       current_price,
+        "invested_amount":     round(invested, 2),
+        "current_value":       round(current_price * quantity, 2),
+        "unrealized_pnl":      round(unrealized_pnl, 2),
+        "unrealized_pnl_pct":  round(pnl_pct, 2),
+        "price_move_abs":      round(price_move, 2),
+        "price_move_pct":      round((price_move / entry_price * 100) if entry_price > 0 else 0, 2),
+        "nearest_resistance":  nearest_resistance,
+        "nearest_support":     nearest_support,
+        "distance_to_max_pain": round(distance_to_max_pain, 2) if distance_to_max_pain is not None else None,
+    }
+
+
+def _build_position_prompt(
+    symbol: str,
+    pos_metrics: dict,
+    price_data: dict,
+    options_data: Optional[OptionChainData],
+    ratings: Optional[dict],
+    news: list,
+) -> str:
+    """
+    Build a position-aware prompt for Claude.
+
+    Mental frame: "I'm holding this position right now, what should I do?"
+    Not "Should I open this position?" — those are different questions.
+    """
+    p           = price_data
+    direction   = pos_metrics["direction"]
+    entry       = pos_metrics["entry_price"]
+    qty         = pos_metrics["quantity"]
+    cur         = pos_metrics["current_price"]
+    pnl         = pos_metrics["unrealized_pnl"]
+    pnl_pct     = pos_metrics["unrealized_pnl_pct"]
+    invested    = pos_metrics["invested_amount"]
+    cur_val     = pos_metrics["current_value"]
+
+    pnl_status = "IN PROFIT" if pnl > 0 else ("IN LOSS" if pnl < 0 else "FLAT")
+
+    # ----- Section: Position Snapshot -----
+    position_block = (
+        f"## CURRENT POSITION\n"
+        f"- Symbol:           {symbol}\n"
+        f"- Direction:        {direction.upper()}\n"
+        f"- Quantity:         {qty} shares\n"
+        f"- Entry price:      ₹{entry:.2f}\n"
+        f"- Current price:    ₹{cur:.2f}\n"
+        f"- Price move:       {pos_metrics['price_move_abs']:+.2f} ({pos_metrics['price_move_pct']:+.2f}%)\n"
+        f"- Invested amount:  ₹{invested:,.2f}\n"
+        f"- Current value:    ₹{cur_val:,.2f}\n"
+        f"- Unrealized P&L:   ₹{pnl:,.2f} ({pnl_pct:+.2f}%) — {pnl_status}\n"
+    )
+
+    # ----- Section: Technicals -----
+    tech_block = (
+        f"\n## TECHNICAL CONTEXT\n"
+        f"- RSI(14):     {p['rsi_14']}\n"
+        f"- ATR(14):     ₹{p.get('atr_14', 0):.2f} (avg daily range)\n"
+        f"- SMA 20:      ₹{p.get('sma_20', 0):.2f}\n"
+        f"- SMA 50:      ₹{p.get('sma_50', 0):.2f}\n"
+        f"- SMA 200:     ₹{p.get('sma_200', 0):.2f}\n"
+        f"- BB Upper:    ₹{p.get('bb_upper', 0):.2f}\n"
+        f"- BB Lower:    ₹{p.get('bb_lower', 0):.2f}\n"
+        f"- MACD:        {p.get('macd', 0):.2f} (signal {p.get('macd_signal', 0):.2f})\n"
+        f"- 1D change:   {p['pct_change_1d']:+.2f}%\n"
+        f"- 30D change:  {p['pct_change_30d']:+.2f}%\n"
+        f"- 52W range:   ₹{p['low_52w']:.2f} – ₹{p['high_52w']:.2f}\n"
+        f"- Volume:      {p['volume_ratio']:.1f}x avg\n"
+    )
+
+    # ----- Section: Options Context -----
+    options_block = ""
+    if options_data:
+        nearest_r = pos_metrics["nearest_resistance"]
+        nearest_s = pos_metrics["nearest_support"]
+        options_block = (
+            f"\n## OPTIONS SENTIMENT (F&O expiry {options_data.expiry_date})\n"
+            f"- PCR (OI):              {options_data.pcr_oi:.2f} → {options_data.pcr_signal}\n"
+            f"- Max Pain:              ₹{options_data.max_pain:.2f} "
+            f"(spot is {pos_metrics['distance_to_max_pain']:+.2f}% from it)\n"
+            f"- OI Buildup:            {options_data.buildup_signal}\n"
+            f"- Composite signal:      {options_data.composite_signal} "
+            f"({options_data.composite_strength}/5)\n"
+            f"- Highest Call OI (resistance): ₹{nearest_r}\n"
+            f"- Highest Put OI (support):     ₹{nearest_s}\n"
+        )
+        if options_data.confirmations:
+            confs = "\n".join(f"  • {c}" for c in options_data.confirmations[:5])
+            options_block += f"- Signal rationale:\n{confs}\n"
+    else:
+        options_block = "\n## OPTIONS SENTIMENT\nNot available (non-F&O stock).\n"
+
+    # ----- Section: Analyst Ratings -----
+    analyst_block = ""
+    if ratings and ratings.get("data_source") != "unavailable":
+        pt = ratings.get("price_target") or {}
+        consensus = ratings.get("consensus") or "Unknown"
+        target_mean = pt.get("mean")
+        analyst_block = f"\n## ANALYST CONSENSUS\n- Rating: {consensus}\n"
+        if target_mean:
+            upside = ((target_mean - cur) / cur) * 100
+            analyst_block += (
+                f"- Mean target: ₹{target_mean:.2f} ({upside:+.2f}% from current)\n"
+            )
+        if pt.get("low") and pt.get("high"):
+            analyst_block += f"- Target range: ₹{pt['low']:.2f} – ₹{pt['high']:.2f}\n"
+
+    # ----- Section: News -----
+    news_block = ""
+    if news:
+        news_block = "\n## RECENT NEWS (last 7 days)\n"
+        for item in news[:5]:
+            age = "today" if item.get("age_days") == 0 else f"{item.get('age_days')}d ago"
+            news_block += f"- [{age}] {item.get('title', '')[:120]}\n"
+
+    # ----- Bring it all together -----
+    return f"""You are a senior portfolio manager advising a retail F&O trader on the
+Indian NSE about an EXISTING position they already hold. The trader is NOT
+asking whether to open this trade — they're already in. Your job is to help
+them MANAGE it: hold, exit, scale, or adjust risk.
+
+{position_block}
+{tech_block}
+{options_block}
+{analyst_block}
+{news_block}
+
+## YOUR TASK
+
+Write a focused, actionable analysis in markdown with these EXACT sections:
+
+### 1. Verdict
+A one-line directional call: **STRONG HOLD** / **HOLD** / **TRIM** / **EXIT** / **CONSIDER SCALING UP** / **CONSIDER SCALING DOWN**.
+Follow with 2-3 sentences justifying the verdict using the strongest signals above.
+
+### 2. Critical Price Points
+Concrete levels the trader must watch, with brief rationale:
+- **Profit lock zone:** where to consider booking partial profits (cite the technical or option level)
+- **Stop loss suggestion:** based on ATR / BBands / OI support, NOT entry price
+- **Breakout/breakdown trigger:** the level that would invalidate or strengthen the thesis
+- **Target zone:** where to fully exit if the trade works
+
+For a {direction.upper()} position, "profit zone" is above entry for long / below entry for short.
+
+### 3. Exit Strategy
+A step-by-step plan:
+- When to take partial profits (% of position to trim, at what price)
+- When to move stop to breakeven
+- When to fully exit
+- Time-based exit: if the position goes nowhere for N days, what's the rule?
+
+### 4. Risk Management Adjustments
+- Recommended trailing stop methodology (e.g., "2× ATR below 20DMA")
+- Position size review: is the current ₹{cur_val:,.0f} exposure appropriate given the volatility shown?
+- Hedge consideration: would a protective option leg make sense here?
+
+### 5. Scaling Decision
+Given the current setup, should the trader:
+- **Add more** (and what conditions would trigger that)
+- **Reduce** (and how much)
+- **Hold size as-is**
+Explain the reasoning.
+
+### 6. Time Horizon & Watch List
+- Expected holding duration for the thesis to play out (days/weeks/months)
+- Specific upcoming events to monitor (earnings, expiry, sector news)
+- A clear "exit signal checklist" — bullet 3-4 conditions that would force an exit regardless of price
+
+### 7. Important Caveats
+- Acknowledge what's unknown (no stop loss info from user, etc.)
+- Note any specific risks given the {direction.upper()} direction
+
+Be direct and concrete. Use actual ₹ values, not vague language. The trader needs
+decisions they can act on TODAY, not generic advice."""
+
+
+@app.route("/api/position", methods=["POST"])
+def get_position_insights():
+    """
+    AI-powered insights on an existing position.
+
+    Body:
+      {
+        "symbol":      "RELIANCE",
+        "entry_price": 2450.00,
+        "direction":   "long" | "short",
+        "quantity":    50
+      }
+
+    Returns JSON with position metrics + AI guidance.
+    """
+    if not anthropic_client:
+        return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
+
+    body = request.get_json(silent=True) or {}
+
+    # --- Input validation ---
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    if not all(c.isalnum() or c in "&-" for c in symbol):
+        return jsonify({"error": "invalid symbol"}), 400
+
+    try:
+        entry_price = float(body.get("entry_price", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "entry_price must be a number"}), 400
+    if entry_price <= 0:
+        return jsonify({"error": "entry_price must be > 0"}), 400
+
+    direction = (body.get("direction") or "long").strip().lower()
+    if direction not in ("long", "short"):
+        return jsonify({"error": "direction must be 'long' or 'short'"}), 400
+
+    try:
+        quantity = int(body.get("quantity", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "quantity must be an integer"}), 400
+    if quantity <= 0:
+        return jsonify({"error": "quantity must be > 0"}), 400
+
+    logger.info("Position insights for %s (%s %d @ ₹%.2f)",
+                symbol, direction, quantity, entry_price)
+
+    # --- Fetch data in parallel (same pattern as /api/compare) ---
+    price_data = _fetch_price_data(symbol)
+    if price_data is None:
+        return jsonify({"error": f"Could not fetch data for {symbol}"}), 404
+
+    current_price = price_data["current_price"]
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_ratings = executor.submit(_fetch_analyst_ratings, symbol)
+        future_options = executor.submit(fetch_options_data, symbol, current_price)
+        future_news    = executor.submit(_fetch_news, symbol, 5)
+
+        ratings      = future_ratings.result()
+        options_data = future_options.result()
+        news         = future_news.result()
+
+    # --- Compute position-specific metrics ---
+    pos_metrics = _compute_position_metrics(
+        entry_price, direction, quantity, current_price, options_data
+    )
+
+    # --- AI analysis ---
+    prompt = _build_position_prompt(
+        symbol, pos_metrics, price_data, options_data, ratings, news
+    )
+
+    try:
+        response = anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        ai_text = "".join(
+            block.text for block in response.content if hasattr(block, "text")
+        )
+    except Exception as e:
+        logger.exception("Anthropic API call failed: %s", e)
+        return jsonify({"error": f"AI analysis failed: {str(e)}"}), 500
+
+    # --- Serialize options data for the dashboard (same shape as /api/analyze) ---
+    options_payload = None
+    if options_data is not None:
+        options_payload = {
+            "expiry_date":       options_data.expiry_date,
+            "pcr_oi":            round(options_data.pcr_oi, 2),
+            "max_pain":          round(options_data.max_pain, 2),
+            "pct_from_max_pain": round((options_data.underlying_price - options_data.max_pain) / options_data.max_pain * 100, 2) if options_data.max_pain else 0,
+            "highest_call_oi_strike": options_data.highest_call_oi_strike,
+            "highest_put_oi_strike":  options_data.highest_put_oi_strike,
+            "pcr_signal":             options_data.pcr_signal,
+            "buildup_signal":         options_data.buildup_signal,
+            "composite_signal":       options_data.composite_signal,
+            "composite_strength":     options_data.composite_strength,
+            "confirmations":          options_data.confirmations,
+        }
+
+    return jsonify({
+        "symbol":         symbol,
+        "analyzed_at":    datetime.utcnow().isoformat() + "Z",
+        "position":       pos_metrics,
+        "price_data":     price_data,
+        "options":        options_payload,
+        "ratings":        ratings,
+        "news":           news,
+        "ai_analysis":    ai_text,
+        "model":          ANTHROPIC_MODEL,
     }), 200
 
 
