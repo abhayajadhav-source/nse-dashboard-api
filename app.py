@@ -1323,158 +1323,19 @@ def get_strategy():
     ratings = _fetch_analyst_ratings(symbol)
 
     # Convert option chain to StrategyContext format.
-    # IMPORTANT: top_strikes from options_analyzer doesn't include LTPs by default.
-    # We try multiple field names, then fall back to re-fetching the raw Upstox chain
-    # to populate LTPs. Without LTPs, all strategy builders return None.
+    # options_analyzer now includes call_ltp + put_ltp directly in top_strikes
+    # (sourced from Upstox's market_data.ltp, falling back to close_price after
+    # market hours). No second HTTP call needed.
     strikes = []
-    missing_ltp_count = 0
-
     for s in (options_data.top_strikes or []):
-        # Try every plausible field name for call/put LTP
-        call_ltp = (
-            s.get("call_ltp")
-            or s.get("call_last_price")
-            or s.get("callLastPrice")
-            or s.get("ce_ltp")
-            or 0.0
-        )
-        put_ltp = (
-            s.get("put_ltp")
-            or s.get("put_last_price")
-            or s.get("putLastPrice")
-            or s.get("pe_ltp")
-            or 0.0
-        )
-        if call_ltp == 0.0 or put_ltp == 0.0:
-            missing_ltp_count += 1
-
         strikes.append(OptionStrike(
             strike=s["strike"],
-            call_ltp=float(call_ltp),
+            call_ltp=float(s.get("call_ltp") or 0.0),
             call_oi=s.get("call_oi", 0),
-            put_ltp=float(put_ltp),
+            put_ltp=float(s.get("put_ltp") or 0.0),
             put_oi=s.get("put_oi", 0),
             distance_from_spot=s.get("distance_from_spot", 0.0),
         ))
-
-    # If most strikes are missing LTPs, fetch raw Upstox option chain directly
-    # via HTTP to populate them. We don't import from upstox_client because
-    # the function names there may not match — we just hit the API directly.
-    if missing_ltp_count >= len(strikes) * 0.5 and len(strikes) > 0:
-        logger.warning(
-            "Strategy: %d/%d strikes missing LTP from top_strikes; "
-            "fetching raw Upstox chain to populate premiums",
-            missing_ltp_count, len(strikes)
-        )
-        upstox_token = os.getenv("UPSTOX_ACCESS_TOKEN", "")
-        if not upstox_token:
-            logger.error("UPSTOX_ACCESS_TOKEN not set — cannot backfill LTPs")
-        else:
-            try:
-                import requests
-
-                headers = {
-                    "Authorization": f"Bearer {upstox_token}",
-                    "Accept": "application/json",
-                }
-
-                # Step 1: Look up instrument key for this NSE equity symbol
-                search_url = "https://api.upstox.com/v2/search/instruments"
-                search_resp = requests.get(
-                    search_url,
-                    params={"query": symbol, "exchange": "NSE_EQ"},
-                    headers=headers,
-                    timeout=10,
-                )
-                instrument_key = None
-                if search_resp.status_code == 200:
-                    results = (search_resp.json() or {}).get("data", []) or []
-                    for r in results:
-                        # Match exact symbol on NSE_EQ
-                        if (r.get("trading_symbol", "").upper() == symbol.upper()
-                                and r.get("exchange") == "NSE_EQ"):
-                            instrument_key = r.get("instrument_key")
-                            break
-                    if instrument_key is None and results:
-                        # Fall back to first result
-                        instrument_key = results[0].get("instrument_key")
-                else:
-                    logger.warning("Upstox instrument search HTTP %d", search_resp.status_code)
-
-                # Step 2: Get nearest expiry from option contract metadata
-                expiry = None
-                if instrument_key:
-                    contracts_url = "https://api.upstox.com/v2/option/contract"
-                    contracts_resp = requests.get(
-                        contracts_url,
-                        params={"instrument_key": instrument_key},
-                        headers=headers,
-                        timeout=10,
-                    )
-                    if contracts_resp.status_code == 200:
-                        contracts = (contracts_resp.json() or {}).get("data", []) or []
-                        # Collect unique expiry dates, pick the nearest future one
-                        from datetime import datetime as dt
-                        today = dt.now().date()
-                        expiries = sorted({c.get("expiry") for c in contracts if c.get("expiry")})
-                        for e in expiries:
-                            try:
-                                e_date = dt.strptime(e, "%Y-%m-%d").date()
-                                if e_date >= today:
-                                    expiry = e
-                                    break
-                            except Exception:
-                                continue
-                    else:
-                        logger.warning("Upstox option/contract HTTP %d", contracts_resp.status_code)
-
-                # Step 3: Fetch the option chain for the nearest expiry
-                if instrument_key and expiry:
-                    chain_url = "https://api.upstox.com/v2/option/chain"
-                    chain_resp = requests.get(
-                        chain_url,
-                        params={"instrument_key": instrument_key, "expiry_date": expiry},
-                        headers=headers,
-                        timeout=15,
-                    )
-                    if chain_resp.status_code == 200:
-                        chain_data = (chain_resp.json() or {}).get("data", []) or []
-                        # Build strike -> LTPs map
-                        chain_lookup = {}
-                        for entry in chain_data:
-                            sp = entry.get("strike_price")
-                            if sp is None:
-                                continue
-                            co_md = (entry.get("call_options") or {}).get("market_data") or {}
-                            po_md = (entry.get("put_options") or {}).get("market_data") or {}
-                            chain_lookup[float(sp)] = {
-                                "call_ltp": float(co_md.get("ltp") or 0.0),
-                                "put_ltp":  float(po_md.get("ltp") or 0.0),
-                            }
-                        # Backfill into our strikes list
-                        backfilled = 0
-                        for strike_obj in strikes:
-                            ltps = chain_lookup.get(strike_obj.strike)
-                            if ltps:
-                                if strike_obj.call_ltp == 0.0 and ltps["call_ltp"] > 0:
-                                    strike_obj.call_ltp = ltps["call_ltp"]
-                                    backfilled += 1
-                                if strike_obj.put_ltp == 0.0 and ltps["put_ltp"] > 0:
-                                    strike_obj.put_ltp = ltps["put_ltp"]
-                        logger.info(
-                            "Backfilled LTPs into %d strike legs from Upstox chain (%d entries available)",
-                            backfilled, len(chain_lookup)
-                        )
-                    else:
-                        logger.warning("Upstox option/chain HTTP %d: %s",
-                                       chain_resp.status_code, chain_resp.text[:200])
-                else:
-                    logger.error(
-                        "Could not resolve instrument_key=%s or expiry=%s for %s",
-                        instrument_key, expiry, symbol
-                    )
-            except Exception as e:
-                logger.exception("Upstox LTP backfill failed: %s", e)
 
     strikes.sort(key=lambda s: s.strike)
 
@@ -1492,8 +1353,9 @@ def get_strategy():
             "message": (
                 f"Option premiums (LTPs) not available in chain data. "
                 f"Only {strikes_with_premium} of {len(strikes)} strikes have premiums. "
-                f"This usually means options_analyzer.py doesn't include LTPs in top_strikes. "
-                f"Check the API logs and patch options_analyzer.py per the strategy_engine docs."
+                f"Check Render logs for the 'Options chain parsed' line — if it shows "
+                f"'0 with LTPs', the Upstox option chain endpoint isn't returning ltp/close_price "
+                f"for this symbol (possibly illiquid expiry). Try a more active F&O stock."
             )
         }), 500
 
