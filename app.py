@@ -197,10 +197,15 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
 
     Cache-first strategy:
       1. Check Postgres cache — if fresh (<6h), return immediately
-      2. Otherwise, call yfinance
+      2. Otherwise, call yfinance with multiple fallback strategies
       3. On success, save to cache and return fresh data
       4. On rate-limit / failure, return empty result (cold-start behavior:
          show 'no data' rather than ancient cached entries)
+
+    Known issue: yfinance's `ticker.info` for .NS (Indian) symbols often
+    returns a partial response WITHOUT the analyst fields, even though
+    Yahoo's website shows them. We log what's missing for diagnostics, and
+    try multiple yfinance attributes as fallbacks before giving up.
     """
     yf_symbol = f"{symbol}.NS"
     empty_result = {
@@ -223,10 +228,23 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
         ticker = yf.Ticker(yf_symbol)
         info   = ticker.info or {}
 
+        # Diagnostic: log what analyst-related keys are actually present in info.
+        # If you see "[no analyst keys]" repeatedly, Yahoo's .NS feed is the issue.
+        analyst_keys_present = [
+            k for k in info.keys()
+            if any(w in k.lower() for w in ['recommend', 'analyst', 'target'])
+        ]
+        if analyst_keys_present:
+            logger.info("Analyst keys present for %s: %s", symbol, analyst_keys_present)
+        else:
+            logger.warning("No analyst keys in ticker.info for %s (info had %d total keys) — "
+                           "Yahoo .NS feed limitation", symbol, len(info))
+
         rec_key   = info.get("recommendationKey")
         rec_mean  = info.get("recommendationMean")
         num_anlst = info.get("numberOfAnalystOpinions")
 
+        # --- Strategy 1: recommendations_summary attribute (aggregated counts) ---
         try:
             rec_df = ticker.recommendations_summary
             if rec_df is not None and not rec_df.empty:
@@ -239,15 +257,52 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
                     "strong_sell": int(row.get("strongSell", 0) or 0),
                 }
                 result["summary"]["total"] = sum(result["summary"].values())
-        except Exception:
-            pass
+                logger.info("Got recommendations_summary for %s: %d analysts",
+                            symbol, result["summary"]["total"])
+        except Exception as e:
+            logger.debug("recommendations_summary failed for %s: %s", symbol, e)
 
+        # --- Strategy 2: legacy recommendations attribute (raw broker actions) ---
+        # If summary failed, try the older `recommendations` attribute. It's a
+        # different shape (history of broker actions) but we can derive a summary
+        # from the most recent N entries.
+        if result["summary"] is None:
+            try:
+                old_rec = ticker.recommendations
+                if old_rec is not None and not old_rec.empty:
+                    # Get the most recent ~20 actions and tally them
+                    recent_actions_df = old_rec.tail(20)
+                    counts = {"strong_buy": 0, "buy": 0, "hold": 0, "sell": 0, "strong_sell": 0}
+                    for _, row in recent_actions_df.iterrows():
+                        grade = str(row.get("To Grade", "") or row.get("ToGrade", "")).lower().strip()
+                        if "strong buy" in grade or "strongbuy" in grade:
+                            counts["strong_buy"] += 1
+                        elif "buy" in grade or "outperform" in grade or "overweight" in grade:
+                            counts["buy"] += 1
+                        elif "hold" in grade or "neutral" in grade or "market perform" in grade:
+                            counts["hold"] += 1
+                        elif "strong sell" in grade or "strongsell" in grade:
+                            counts["strong_sell"] += 1
+                        elif "sell" in grade or "underperform" in grade or "underweight" in grade:
+                            counts["sell"] += 1
+                    total = sum(counts.values())
+                    if total > 0:
+                        counts["total"] = total
+                        result["summary"] = counts
+                        logger.info("Derived summary from recommendations history for %s: %d actions",
+                                    symbol, total)
+            except Exception as e:
+                logger.debug("recommendations history failed for %s: %s", symbol, e)
+
+        # --- Strategy 3: fall back to just analyst count from info ---
         if result["summary"] is None and num_anlst:
             result["summary"] = {
                 "strong_buy": 0, "buy": 0, "hold": 0, "sell": 0, "strong_sell": 0,
                 "total": int(num_anlst),
             }
+            logger.info("Got analyst count only for %s: %d (no breakdown)", symbol, num_anlst)
 
+        # --- Consensus label ---
         if rec_key and rec_key != "none":
             label_map = {
                 "strong_buy": "Strong Buy", "buy": "Buy", "hold": "Hold",
@@ -262,6 +317,7 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
             elif rec_mean <= 4.5: result["consensus"] = "Sell"
             else:                 result["consensus"] = "Strong Sell"
 
+        # --- Price targets ---
         target_mean   = info.get("targetMeanPrice")
         target_high   = info.get("targetHighPrice")
         target_low    = info.get("targetLowPrice")
@@ -278,7 +334,29 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
                 "count":    int(target_count) if target_count else None,
                 "currency": currency,
             }
+            logger.info("Got price target for %s: ₹%.2f (n=%s)",
+                        symbol, target_mean, target_count)
 
+        # --- Strategy 4: analyst_price_targets (newer yfinance attribute) ---
+        # If we didn't get price target from info, try the dedicated method
+        if result["price_target"] is None:
+            try:
+                apt = ticker.analyst_price_targets
+                if apt and isinstance(apt, dict) and apt.get("mean"):
+                    result["price_target"] = {
+                        "mean":     round(float(apt["mean"]), 2),
+                        "median":   round(float(apt["median"]), 2) if apt.get("median") else None,
+                        "high":     round(float(apt["high"]), 2) if apt.get("high") else None,
+                        "low":      round(float(apt["low"]), 2) if apt.get("low") else None,
+                        "count":    None,
+                        "currency": currency,
+                    }
+                    logger.info("Got price target via analyst_price_targets for %s: ₹%.2f",
+                                symbol, apt["mean"])
+            except Exception as e:
+                logger.debug("analyst_price_targets failed for %s: %s", symbol, e)
+
+        # --- Recent broker upgrades/downgrades ---
         try:
             upgrades_df = ticker.upgrades_downgrades
             if upgrades_df is not None and not upgrades_df.empty:
@@ -295,12 +373,21 @@ def _fetch_analyst_ratings(symbol: str) -> dict:
                         "from_grade": str(row.get("FromGrade", "") or ""),
                         "action":     str(row.get("Action", "") or ""),
                     })
-        except Exception:
-            pass
+                if result["recent_actions"]:
+                    logger.info("Got %d recent actions for %s",
+                                len(result["recent_actions"]), symbol)
+        except Exception as e:
+            logger.debug("upgrades_downgrades failed for %s: %s", symbol, e)
 
         if (result["summary"] or result["consensus"] or
             result["price_target"] or result["recent_actions"]):
             result["data_source"] = "yfinance"
+        else:
+            logger.warning(
+                "All analyst strategies returned empty for %s — "
+                "Yahoo doesn't have data for this stock, or .NS feed is partial",
+                symbol
+            )
 
     except Exception as e:
         # Most common case: Yahoo "Too Many Requests" rate limit
