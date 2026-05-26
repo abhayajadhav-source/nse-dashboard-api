@@ -2316,6 +2316,23 @@ explains WHY each level makes sense and WHAT TO WATCH FOR.
 Write a focused execution memo in markdown with these EXACT sections (no introduction,
 no preamble — start straight with the first heading):
 
+### Psychology Check
+This is the FIRST section because mental discipline matters more than perfect entries.
+Write 2 parts:
+1. **Setup-specific psychology (2-3 sentences)**: Identify the SPECIFIC emotional traps
+   this {direction_label} setup will trigger for the trader. Examples to draw from:
+   - LONG at extended price: "First 1% gain will feel like 'easy money, take it now'. Don't."
+   - LONG below SMA 200: "When it bounces 3% and stalls, you'll feel vindicated and add too early."
+   - SHORT against bullish consensus: "Every broker upgrade will make you question the thesis."
+   - SHORT in strong uptrend: "Squeeze risk is real; one 5% gap-up will test your conviction."
+   - HEDGED: "If trade works, the put will feel like wasted money — don't unwind early."
+   - Hedged + losing: "Don't roll the put down to 'save money' — that's removing the hedge."
+   Tie this directly to today's specific setup (cite the RSI, trend, or option signal).
+
+2. **Universal reminders (2-3 bullets max)**: Brief, not preachy. Pick the most relevant
+   from: FOMO management, revenge trading after a stop-out, sunk cost on losing positions,
+   over-trading after a winner, journaling the plan vs the execution.
+
 ### Entry Reasoning
 2-3 sentences on why this entry zone makes sense given today's setup. Reference the
 current momentum, RSI, recent price action. If the trade is going WITH the trend
@@ -2353,7 +2370,7 @@ high-probability setup.
 - Acknowledge what's unknowable (gap risk, news shocks, etc.)
 
 Tone: direct, no fluff, no hype, no "this is going to be great". Indian F&O trader,
-serious about discipline. Use specific ₹ values when relevant. Maximum 600 words total."""
+serious about discipline. Use specific ₹ values when relevant. Maximum 750 words total."""
 
 
 @app.route("/api/trade-plan", methods=["POST"])
@@ -2469,7 +2486,7 @@ def get_trade_plan():
     try:
         response = anthropic_client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=2000,
+            max_tokens=2400,
             messages=[{"role": "user", "content": prompt}],
         )
         ai_text = "".join(
