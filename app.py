@@ -1863,5 +1863,635 @@ def get_position_insights():
     }), 200
 
 
+# ===========================================================================
+# TRADE PLAN — algorithmic levels + AI commentary for a new entry
+# ===========================================================================
+#
+# Endpoint: POST /api/trade-plan
+# Body:
+#   { symbol, direction ("long"|"short"|"hedged"),
+#     input_mode ("qty"|"capital"), qty?, capital? }
+#
+# Returns a complete trade plan: entry zone, stop loss, position add zones,
+# laddered profit targets, risk metrics, optional hedge leg (if hedged),
+# AI commentary explaining the rationale.
+#
+# Design:
+#   - Reuse /api/analyze data-fetching (price + options + ratings + news)
+#   - Compute levels algorithmically from objective signals (ATR, OI strikes,
+#     SMAs, 52w high/low) — no AI needed for these
+#   - AI writes the prose explaining WHY each level was chosen and what
+#     conditions would invalidate the plan
+# ===========================================================================
+
+def _compute_trade_levels(
+    direction: str,           # "long" | "short" | "hedged"
+    price_data: dict,
+    options_data: Optional[OptionChainData],
+    ratings: Optional[dict],
+) -> dict:
+    """
+    Algorithmically compute entry zone, stop, add zones, and laddered targets.
+
+    Returns a dict with all numeric levels. AI prompt later uses these to
+    write the commentary; frontend renders them in cards.
+
+    All prices are direction-aware:
+      - For LONG: stops below entry, targets above
+      - For SHORT: stops above entry, targets below
+      - For HEDGED: same as LONG but with a protective put leg
+    """
+    price   = price_data["current_price"]
+    atr     = price_data.get("atr_14") or (price * 0.02)  # 2% fallback
+    sma_20  = price_data.get("sma_20")  or price
+    sma_50  = price_data.get("sma_50")  or price
+    sma_200 = price_data.get("sma_200") or price
+    bb_upper = price_data.get("bb_upper") or (price + 2 * atr)
+    bb_lower = price_data.get("bb_lower") or (price - 2 * atr)
+    high_52w = price_data.get("high_52w") or price
+    low_52w  = price_data.get("low_52w")  or price
+
+    # Option-derived levels (high OI strikes act as dynamic S/R)
+    nearest_resistance = None  # highest Call OI strike (where sellers cluster)
+    nearest_support    = None  # highest Put OI strike (where buyers defend)
+    if options_data:
+        nearest_resistance = options_data.highest_call_oi_strike or None
+        nearest_support    = options_data.highest_put_oi_strike or None
+
+    # Analyst-derived levels
+    analyst_target = None
+    if ratings and ratings.get("price_target"):
+        analyst_target = ratings["price_target"].get("mean")
+
+    # For HEDGED, we treat the underlying entry the same as LONG;
+    # the protective put is computed separately below.
+    is_long = direction in ("long", "hedged")
+    dir_mult = 1 if is_long else -1
+
+    # ----- Entry zone (a range, not a single price) -----
+    # LONG: prefer entering on a small pullback toward (current - 0.5*ATR)
+    # SHORT: prefer entering on a small pop toward (current + 0.5*ATR)
+    if is_long:
+        entry_zone_high = price                           # market entry top
+        entry_zone_low  = price - 0.5 * atr               # patient entry
+    else:
+        entry_zone_low  = price                           # market entry bottom
+        entry_zone_high = price + 0.5 * atr               # patient entry
+    entry_mid = (entry_zone_low + entry_zone_high) / 2
+
+    # ----- Stop loss — multi-candidate, pick the tightest reasonable -----
+    # LONG: stop must be BELOW entry. Pick the highest of valid candidates
+    #   (highest = tightest for long).
+    # SHORT: stop must be ABOVE entry. Pick the lowest valid candidate.
+    stop_candidates = []
+    if is_long:
+        candidates = [
+            {"value": entry_mid - 2 * atr,        "source": f"Entry − 2×ATR (₹{atr:.2f})"},
+            {"value": sma_50 * 0.99,              "source": "1% below SMA 50"},
+            {"value": bb_lower,                   "source": "Bollinger lower band"},
+        ]
+        if nearest_support:
+            # 0.5% below the highest-put-OI strike acts as confirmation level
+            candidates.append({
+                "value": nearest_support * 0.995,
+                "source": f"Just below option support ₹{nearest_support:.0f}",
+            })
+        valid = [c for c in candidates if 0 < c["value"] < entry_mid]
+        if valid:
+            chosen = max(valid, key=lambda c: c["value"])  # tightest = highest
+        else:
+            chosen = {"value": entry_mid * 0.98, "source": "2% below entry (fallback)"}
+    else:
+        candidates = [
+            {"value": entry_mid + 2 * atr,        "source": f"Entry + 2×ATR (₹{atr:.2f})"},
+            {"value": sma_50 * 1.01,              "source": "1% above SMA 50"},
+            {"value": bb_upper,                   "source": "Bollinger upper band"},
+        ]
+        if nearest_resistance:
+            candidates.append({
+                "value": nearest_resistance * 1.005,
+                "source": f"Just above option resistance ₹{nearest_resistance:.0f}",
+            })
+        valid = [c for c in candidates if c["value"] > entry_mid]
+        if valid:
+            chosen = min(valid, key=lambda c: c["value"])  # tightest = lowest
+        else:
+            chosen = {"value": entry_mid * 1.02, "source": "2% above entry (fallback)"}
+
+    stop_loss      = chosen["value"]
+    stop_source    = chosen["source"]
+    risk_per_share = abs(entry_mid - stop_loss)
+
+    # ----- Position add zones -----
+    # Two scenarios: averaging on adverse move (dollar-cost) OR pyramiding on confirmation
+    # We provide both — user decides which approach to use based on trade thesis.
+    if is_long:
+        add_adverse_1 = entry_mid * 0.97       # add at -3%
+        add_adverse_2 = entry_mid * 0.95       # add at -5%
+        add_confirm_1 = entry_mid * 1.02       # add at +2% breakout
+        add_confirm_2 = entry_mid * 1.04       # add at +4% confirmation
+    else:
+        add_adverse_1 = entry_mid * 1.03       # add at +3% (adverse for short)
+        add_adverse_2 = entry_mid * 1.05       # add at +5%
+        add_confirm_1 = entry_mid * 0.98       # add at -2% breakdown
+        add_confirm_2 = entry_mid * 0.96       # add at -4% confirmation
+
+    # ----- Laddered profit targets (3 levels, 33/33/34 split) -----
+    # T1 = 1.5R from entry (mechanical, locks some profit)
+    # T2 = nearest opposing OI strike or analyst target, whichever is closer
+    # T3 = 3R or 52w high/low, whichever is closer
+    t1 = entry_mid + (1.5 * risk_per_share * dir_mult)
+
+    # T2 candidates
+    t2_candidates = []
+    if is_long:
+        if nearest_resistance and nearest_resistance > entry_mid:
+            t2_candidates.append(nearest_resistance)
+        if analyst_target and analyst_target > entry_mid:
+            t2_candidates.append(analyst_target)
+        if high_52w > entry_mid * 1.02:
+            t2_candidates.append(high_52w * 0.99)  # just below 52w high
+        if not t2_candidates:
+            t2_candidates.append(entry_mid + (2.0 * risk_per_share))
+        t2 = min(t2_candidates)  # closest target
+    else:
+        if nearest_support and nearest_support < entry_mid:
+            t2_candidates.append(nearest_support)
+        if analyst_target and analyst_target < entry_mid:
+            t2_candidates.append(analyst_target)
+        if low_52w < entry_mid * 0.98:
+            t2_candidates.append(low_52w * 1.01)  # just above 52w low
+        if not t2_candidates:
+            t2_candidates.append(entry_mid - (2.0 * risk_per_share))
+        t2 = max(t2_candidates)
+
+    # T3 = stretch target
+    t3_mechanical = entry_mid + (3.0 * risk_per_share * dir_mult)
+    if is_long:
+        t3 = min(t3_mechanical, high_52w * 1.05)  # cap at 5% above 52w high
+    else:
+        t3 = max(t3_mechanical, low_52w * 0.95)
+
+    return {
+        "direction":        direction,
+        "current_price":    round(price, 2),
+        "atr":              round(atr, 2),
+        "entry_zone": {
+            "low":    round(entry_zone_low, 2),
+            "mid":    round(entry_mid, 2),
+            "high":   round(entry_zone_high, 2),
+        },
+        "stop_loss": {
+            "price":           round(stop_loss, 2),
+            "source":          stop_source,
+            "distance_pct":    round((stop_loss - entry_mid) / entry_mid * 100, 2),
+            "risk_per_share":  round(risk_per_share, 2),
+        },
+        "add_zones": {
+            "adverse_1":  round(add_adverse_1, 2),
+            "adverse_2":  round(add_adverse_2, 2),
+            "confirm_1":  round(add_confirm_1, 2),
+            "confirm_2":  round(add_confirm_2, 2),
+        },
+        "targets": {
+            "t1": {
+                "price":      round(t1, 2),
+                "label":      "Take 33%",
+                "rationale":  "1.5R from entry — mechanical first profit lock",
+                "r_multiple": 1.5,
+                "pct_move":   round((t1 - entry_mid) / entry_mid * 100, 2),
+            },
+            "t2": {
+                "price":      round(t2, 2),
+                "label":      "Take 33%",
+                "rationale":  _t2_rationale(is_long, t2, nearest_resistance, nearest_support, analyst_target, high_52w, low_52w),
+                "r_multiple": round(abs(t2 - entry_mid) / risk_per_share, 2) if risk_per_share > 0 else 0,
+                "pct_move":   round((t2 - entry_mid) / entry_mid * 100, 2),
+            },
+            "t3": {
+                "price":      round(t3, 2),
+                "label":      "Take 34% (final exit)",
+                "rationale":  "Stretch target — 3R or near 52w extreme",
+                "r_multiple": round(abs(t3 - entry_mid) / risk_per_share, 2) if risk_per_share > 0 else 0,
+                "pct_move":   round((t3 - entry_mid) / entry_mid * 100, 2),
+            },
+        },
+        "reference_levels": {
+            "sma_20":              round(sma_20, 2),
+            "sma_50":              round(sma_50, 2),
+            "sma_200":             round(sma_200, 2),
+            "bb_upper":            round(bb_upper, 2),
+            "bb_lower":            round(bb_lower, 2),
+            "high_52w":            round(high_52w, 2),
+            "low_52w":             round(low_52w, 2),
+            "nearest_resistance":  nearest_resistance,
+            "nearest_support":     nearest_support,
+            "analyst_target":      analyst_target,
+        },
+    }
+
+
+def _t2_rationale(is_long, t2, nr, ns, at, h52, l52):
+    """Generate a human-readable rationale for the T2 target choice."""
+    eps = 0.005  # 0.5% tolerance for matching
+    if is_long:
+        if nr and abs(t2 - nr) / nr < eps:
+            return f"Nearest option resistance (highest Call OI ₹{nr:.0f})"
+        if at and abs(t2 - at) / at < eps:
+            return f"Analyst mean target (₹{at:.0f})"
+        if h52 and abs(t2 - h52 * 0.99) / h52 < eps:
+            return "Just below 52-week high"
+    else:
+        if ns and abs(t2 - ns) / ns < eps:
+            return f"Nearest option support (highest Put OI ₹{ns:.0f})"
+        if at and abs(t2 - at) / at < eps:
+            return f"Analyst mean target (₹{at:.0f})"
+        if l52 and abs(t2 - l52 * 1.01) / l52 < eps:
+            return "Just above 52-week low"
+    return "2R from entry — fallback"
+
+
+def _compute_hedge_leg(
+    price: float, qty: int, options_data: Optional[OptionChainData]
+) -> Optional[dict]:
+    """
+    For HEDGED direction, propose a protective put leg.
+
+    Strategy: buy 1 ATM put per lot of stock (or per equivalent qty of shares
+    that approximates one lot). The put cost is the "insurance premium" you
+    pay to cap downside.
+    """
+    if not options_data or not options_data.top_strikes:
+        return None
+
+    # Find the ATM put (strike closest to current price, with non-zero LTP)
+    candidates = []
+    for s in options_data.top_strikes:
+        ltp = s.get("put_ltp") or 0
+        if ltp <= 0:
+            continue
+        distance = abs(s["strike"] - price)
+        candidates.append((distance, s["strike"], ltp))
+    if not candidates:
+        return None
+
+    candidates.sort()
+    _, strike, ltp = candidates[0]
+
+    # How many puts to buy? Depends on lot size of the underlying.
+    # For a position of `qty` shares, we need `qty / lot_size` puts (rounded up).
+    # But the symbol isn't passed here so we'll just report the per-lot cost
+    # and let the frontend multiply by required lots.
+    return {
+        "leg_type":           "protective_put",
+        "strike":             strike,
+        "premium_per_share":  round(ltp, 2),
+        "cost_per_lot":       None,  # filled by caller who knows the lot size
+        "max_loss_per_share": round(price - strike + ltp, 2),
+        "expiry":             options_data.expiry_date,
+    }
+
+
+def _compute_position_economics(
+    levels: dict, qty: int, lot_size: int, hedge: Optional[dict],
+) -> dict:
+    """Compute risk in ₹ and reward at each target, given the position size."""
+    entry_mid    = levels["entry_zone"]["mid"]
+    stop         = levels["stop_loss"]["price"]
+    risk_per_shr = levels["stop_loss"]["risk_per_share"]
+    direction    = levels["direction"]
+    is_long      = direction in ("long", "hedged")
+
+    capital_required = round(entry_mid * qty, 2)
+    base_risk = round(risk_per_shr * qty, 2)
+
+    # Adjust risk if hedged: protective put caps downside
+    hedge_cost = 0.0
+    effective_risk = base_risk
+    if direction == "hedged" and hedge:
+        # Calculate hedge cost based on lot size — round UP to nearest lot
+        # to avoid under-hedging
+        lots_needed = max(1, -(-qty // lot_size))   # ceiling division
+        hedge_cost  = round(hedge["premium_per_share"] * lot_size * lots_needed, 2)
+        hedge["cost_per_lot"]   = round(hedge["premium_per_share"] * lot_size, 2)
+        hedge["lots_required"]  = lots_needed
+        hedge["total_cost"]     = hedge_cost
+        # With protective put at strike K, max loss per share = (entry - K + premium)
+        # So total max loss = qty × (entry - K) + hedge_cost
+        # Cap this at the algorithmic stop OR the put strike, whichever is closer
+        put_strike_loss = (entry_mid - hedge["strike"]) * qty + hedge_cost
+        # Compare to vanilla stop loss
+        effective_risk = min(base_risk + hedge_cost, max(0, put_strike_loss))
+        effective_risk = round(effective_risk, 2)
+
+    # Reward at each target
+    targets_econ = {}
+    for tier, t in levels["targets"].items():
+        target_price = t["price"]
+        # 33/33/34 split — what's the reward per slice?
+        slice_qty = qty // 3 if tier in ("t1", "t2") else qty - 2 * (qty // 3)
+        gross_reward = (target_price - entry_mid) * slice_qty
+        if not is_long:
+            gross_reward = (entry_mid - target_price) * slice_qty
+        targets_econ[tier] = {
+            "slice_qty":   slice_qty,
+            "exit_value":  round(target_price * slice_qty, 2),
+            "gross_reward": round(gross_reward, 2),
+        }
+
+    # Total reward if all targets hit
+    total_reward = sum(targets_econ[t]["gross_reward"] for t in targets_econ)
+    # Minus hedge cost if applicable
+    net_reward = round(total_reward - hedge_cost, 2)
+
+    return {
+        "qty":                qty,
+        "capital_required":   capital_required,
+        "base_risk":          base_risk,
+        "hedge_cost":         hedge_cost,
+        "effective_risk":     effective_risk,
+        "max_reward":         net_reward,
+        "risk_reward_ratio":  round(net_reward / effective_risk, 2) if effective_risk > 0 else 0,
+        "targets_economics":  targets_econ,
+    }
+
+
+def _build_trade_plan_prompt(
+    symbol: str, direction: str, levels: dict, econ: dict,
+    hedge: Optional[dict], price_data: dict, options_data: Optional[OptionChainData],
+    ratings: Optional[dict],
+) -> str:
+    """
+    Build a focused AI prompt — algo already computed the numbers, AI just
+    explains the rationale.
+    """
+    p = price_data
+    entry = levels["entry_zone"]
+    stop  = levels["stop_loss"]
+    tgts  = levels["targets"]
+
+    direction_label = {
+        "long":   "LONG (buy)",
+        "short":  "SHORT (sell)",
+        "hedged": "HEDGED LONG (buy stock + protective put)",
+    }[direction]
+
+    hedge_block = ""
+    if direction == "hedged" and hedge:
+        hedge_block = (
+            f"\n## HEDGE LEG\n"
+            f"- Protective ATM put strike: ₹{hedge['strike']}\n"
+            f"- Put premium: ₹{hedge['premium_per_share']}/share\n"
+            f"- Total hedge cost: ₹{hedge['total_cost']:,.0f}\n"
+            f"- This caps your max loss at ₹{econ['effective_risk']:,.0f} "
+            f"vs ₹{econ['base_risk']:,.0f} unhedged\n"
+        )
+
+    options_block = ""
+    if options_data:
+        options_block = (
+            f"\n## OPTIONS CONTEXT (F&O {options_data.expiry_date})\n"
+            f"- PCR (OI): {options_data.pcr_oi:.2f} → {options_data.pcr_signal}\n"
+            f"- Max Pain: ₹{options_data.max_pain:.2f}\n"
+            f"- Composite signal: {options_data.composite_signal}\n"
+            f"- Highest Call OI (resistance): ₹{options_data.highest_call_oi_strike}\n"
+            f"- Highest Put OI (support): ₹{options_data.highest_put_oi_strike}\n"
+        )
+
+    analyst_block = ""
+    if ratings and ratings.get("price_target"):
+        pt = ratings["price_target"]
+        analyst_block = (
+            f"\n## ANALYST VIEW\n"
+            f"- Consensus: {ratings.get('consensus', '—')}\n"
+            f"- Mean target: ₹{pt.get('mean', '—')}\n"
+        )
+
+    return f"""You are a senior trading desk strategist writing an execution memo for a
+retail Indian F&O trader who has decided to take a {direction_label} position in
+{symbol}. The numerical levels below have already been computed algorithmically.
+Your job is NOT to second-guess them — they're based on objective signals
+(ATR, OI strikes, SMAs, 52w levels). Your job is to write the COMMENTARY that
+explains WHY each level makes sense and WHAT TO WATCH FOR.
+
+## MARKET CONTEXT
+- Current price: ₹{p['current_price']:.2f}
+- ATR(14): ₹{levels['atr']:.2f}
+- 30D change: {p['pct_change_1d']:+.2f}% (today) · 1D: {p['pct_change_1d']:+.2f}%
+- RSI(14): {p['rsi_14']}
+- SMA 50/200: ₹{p.get('sma_50', 0):.2f} / ₹{p.get('sma_200', 0):.2f}
+- 52w range: ₹{p['low_52w']:.2f} – ₹{p['high_52w']:.2f}
+{options_block}{analyst_block}
+
+## ALGORITHMIC TRADE PLAN (already computed)
+
+### Entry
+- Patient entry zone: ₹{entry['low']:.2f} – ₹{entry['high']:.2f}
+- Midpoint used for risk calc: ₹{entry['mid']:.2f}
+
+### Stop loss
+- Price: ₹{stop['price']:.2f} ({stop['distance_pct']:+.2f}% from entry)
+- Rationale: {stop['source']}
+- Risk per share: ₹{stop['risk_per_share']:.2f}
+
+### Position adds (averaging / scaling)
+- Add on adverse move: ₹{levels['add_zones']['adverse_1']:.2f}, ₹{levels['add_zones']['adverse_2']:.2f}
+- Add on confirmation: ₹{levels['add_zones']['confirm_1']:.2f}, ₹{levels['add_zones']['confirm_2']:.2f}
+
+### Profit targets (ladder)
+- T1 (33% exit): ₹{tgts['t1']['price']:.2f} ({tgts['t1']['r_multiple']:.1f}R) — {tgts['t1']['rationale']}
+- T2 (33% exit): ₹{tgts['t2']['price']:.2f} ({tgts['t2']['r_multiple']:.1f}R) — {tgts['t2']['rationale']}
+- T3 (34% exit): ₹{tgts['t3']['price']:.2f} ({tgts['t3']['r_multiple']:.1f}R) — {tgts['t3']['rationale']}
+
+### Position economics
+- Quantity: {econ['qty']} shares
+- Capital deployed: ₹{econ['capital_required']:,.0f}
+- Total risk: ₹{econ['effective_risk']:,.0f}
+- Max reward (all targets): ₹{econ['max_reward']:,.0f}
+- Risk:Reward ratio: 1:{econ['risk_reward_ratio']:.2f}
+{hedge_block}
+
+## YOUR TASK
+
+Write a focused execution memo in markdown with these EXACT sections (no introduction,
+no preamble — start straight with the first heading):
+
+### Entry Reasoning
+2-3 sentences on why this entry zone makes sense given today's setup. Reference the
+current momentum, RSI, recent price action. If the trade is going WITH the trend
+(e.g., LONG on a stock above its rising SMAs), say so. If it's a counter-trend
+play, flag the additional risk.
+
+### Stop Loss Logic
+2-3 sentences explaining what would invalidate this trade. Reference the specific
+source of the stop (e.g., "the SMA 50 has acted as support 3x this quarter").
+Be specific about what price action you'd see if the stop gets hit.
+
+### Add Strategy
+2-3 sentences on when to use adverse-move adds vs confirmation adds. Explicitly
+recommend ONE approach as default for this specific setup, based on whether the
+trend is intact or weakening.
+
+### Target Reasoning
+For each of T1/T2/T3, one sentence on what catalyst or condition would get price there.
+What price action is the AI watching for between T1 and T2? Between T2 and T3?
+
+### Position Sizing Sanity Check
+One paragraph: is this position size reasonable? Use the risk:reward ratio and the
+% of typical daily move (ATR) the trade requires. If the trade needs price to move
+>2x the daily ATR to hit T2, flag that. If it can hit T2 within 1 ATR, say it's a
+high-probability setup.
+
+### Watch List (3-4 bullets)
+- Specific events to monitor: earnings dates if approaching, F&O expiry day, sector news
+- Price levels that would force re-evaluation BEFORE the stop hits
+- Volume conditions that would confirm/invalidate the move
+- {("If hedged: note any condition where the hedge becomes unnecessary" if direction == "hedged" else "If short: explicitly note short-squeeze risk and how to spot it" if direction == "short" else "Time decay: if the trade goes nowhere for N trading days, what's the rule?")}
+
+### Important Caveats
+- 2-3 honest risks that the algorithmic plan doesn't account for
+- Acknowledge what's unknowable (gap risk, news shocks, etc.)
+
+Tone: direct, no fluff, no hype, no "this is going to be great". Indian F&O trader,
+serious about discipline. Use specific ₹ values when relevant. Maximum 600 words total."""
+
+
+@app.route("/api/trade-plan", methods=["POST"])
+def get_trade_plan():
+    """
+    Generate a concrete trade plan with algorithmic levels + AI commentary.
+
+    Body:
+      {
+        "symbol":      "RELIANCE",
+        "direction":   "long" | "short" | "hedged",
+        "input_mode":  "qty" | "capital",
+        "qty":         100,           # required if input_mode == "qty"
+        "capital":     250000.0,      # required if input_mode == "capital"
+      }
+    """
+    if not anthropic_client:
+        return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
+
+    body = request.get_json(silent=True) or {}
+
+    # --- Input validation ---
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    if not all(c.isalnum() or c in "&-" for c in symbol):
+        return jsonify({"error": "invalid symbol"}), 400
+
+    direction = (body.get("direction") or "long").strip().lower()
+    if direction not in ("long", "short", "hedged"):
+        return jsonify({"error": "direction must be 'long', 'short', or 'hedged'"}), 400
+
+    input_mode = (body.get("input_mode") or "qty").strip().lower()
+    if input_mode not in ("qty", "capital"):
+        return jsonify({"error": "input_mode must be 'qty' or 'capital'"}), 400
+
+    qty = 0
+    capital = 0.0
+    if input_mode == "qty":
+        try:
+            qty = int(body.get("qty", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "qty must be an integer"}), 400
+        if qty <= 0:
+            return jsonify({"error": "qty must be > 0"}), 400
+    else:
+        try:
+            capital = float(body.get("capital", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "capital must be a number"}), 400
+        if capital <= 0:
+            return jsonify({"error": "capital must be > 0"}), 400
+
+    logger.info("Trade plan for %s (%s, %s=%s)",
+                symbol, direction, input_mode, qty or capital)
+
+    # --- Fetch market data in parallel ---
+    price_data = _fetch_price_data(symbol)
+    if price_data is None:
+        return jsonify({"error": f"Could not fetch price data for {symbol}"}), 404
+
+    current_price = price_data["current_price"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_ratings = executor.submit(_fetch_analyst_ratings, symbol)
+        future_options = executor.submit(fetch_options_data, symbol, current_price)
+        ratings      = future_ratings.result()
+        options_data = future_options.result()
+
+    # Hedged direction requires options data — fail gracefully if unavailable
+    if direction == "hedged" and not options_data:
+        return jsonify({
+            "error": "no_options_data",
+            "message": (f"{symbol} is not in F&O segment — cannot hedge with a "
+                        f"protective put. Choose Long or Short direction instead."),
+        }), 400
+
+    # --- Compute algorithmic levels ---
+    levels = _compute_trade_levels(direction, price_data, options_data, ratings)
+
+    # If user provided capital instead of qty, derive qty from capital + entry midpoint
+    entry_mid = levels["entry_zone"]["mid"]
+    if input_mode == "capital":
+        qty = int(capital // entry_mid)
+        if qty <= 0:
+            return jsonify({
+                "error": "capital_too_small",
+                "message": (f"Capital ₹{capital:,.0f} is less than 1 share of "
+                            f"{symbol} at ₹{entry_mid:.2f}. Increase capital or use qty input."),
+            }), 400
+
+    # --- Compute hedge leg (if hedged) ---
+    hedge = None
+    lot_size = _get_lot_size(symbol)
+    if direction == "hedged":
+        hedge = _compute_hedge_leg(current_price, qty, options_data)
+        if hedge is None:
+            return jsonify({
+                "error": "no_atm_put",
+                "message": (f"No ATM put with valid premium found for {symbol}. "
+                            f"Try a different stock or non-hedged direction."),
+            }), 400
+
+    # --- Compute position economics ---
+    econ = _compute_position_economics(levels, qty, lot_size, hedge)
+
+    # --- AI commentary ---
+    prompt = _build_trade_plan_prompt(
+        symbol, direction, levels, econ, hedge,
+        price_data, options_data, ratings,
+    )
+
+    try:
+        response = anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        ai_text = "".join(
+            block.text for block in response.content if hasattr(block, "text")
+        )
+    except Exception as e:
+        logger.exception("Anthropic API call failed: %s", e)
+        return jsonify({"error": f"AI commentary failed: {str(e)}"}), 500
+
+    return jsonify({
+        "symbol":         symbol,
+        "analyzed_at":    datetime.utcnow().isoformat() + "Z",
+        "direction":      direction,
+        "input_mode":     input_mode,
+        "lot_size":       lot_size,
+        "levels":         levels,
+        "economics":      econ,
+        "hedge":          hedge,
+        "ai_commentary":  ai_text,
+        "model":          ANTHROPIC_MODEL,
+    }), 200
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
