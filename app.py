@@ -2152,6 +2152,38 @@ def _compute_hedge_leg(
     }
 
 
+def _recompute_targets_from_entry(levels: dict, entry: float, direction: str) -> dict:
+    """
+    When user is in an existing position, their entry is fixed at `entry`.
+    The algorithmic targets were computed from the entry-zone midpoint, so
+    R-multiples need to be recomputed from the user's actual entry to be
+    honest about reward potential.
+
+    Stop loss is unchanged — it's still the algo-recommended stop.
+    Add zones are also unchanged — they're forward-looking "if you wanted
+    to add" prices, independent of where the user originally entered.
+    """
+    is_long = direction in ("long", "hedged")
+    stop_price = levels["stop_loss"]["price"]
+    risk_per_share = abs(entry - stop_price)
+    if risk_per_share <= 0:
+        return levels  # bail — avoid divide by zero
+
+    # Recompute the risk_per_share on stop_loss so econ uses it correctly
+    levels["stop_loss"]["risk_per_share"] = round(risk_per_share, 2)
+    levels["stop_loss"]["distance_pct"] = round((stop_price - entry) / entry * 100, 2)
+
+    # Recompute R-multiples for each target based on user's actual entry
+    for tier_key in ("t1", "t2", "t3"):
+        t = levels["targets"][tier_key]
+        target_price = t["price"]
+        distance = abs(target_price - entry)
+        t["r_multiple"] = round(distance / risk_per_share, 2) if risk_per_share > 0 else 0
+        t["pct_move"]   = round((target_price - entry) / entry * 100, 2)
+
+    return levels
+
+
 def _compute_position_economics(
     levels: dict, qty: int, lot_size: int, hedge: Optional[dict],
 ) -> dict:
@@ -2220,10 +2252,19 @@ def _build_trade_plan_prompt(
     symbol: str, direction: str, levels: dict, econ: dict,
     hedge: Optional[dict], price_data: dict, options_data: Optional[OptionChainData],
     ratings: Optional[dict],
+    mode: str = "new",
+    existing_position: Optional[dict] = None,
 ) -> str:
     """
     Build a focused AI prompt — algo already computed the numbers, AI just
     explains the rationale.
+
+    For existing-position mode, prepends a context block with unrealized P&L,
+    days held, and the user's stop vs algo stop comparison. Asks the AI to
+    specifically advise on whether to:
+      - Keep current stop or adopt the algo stop
+      - Hold / partial exit / full exit at current spot
+      - What conditions would trigger an early exit
     """
     p = price_data
     entry = levels["entry_zone"]
@@ -2235,6 +2276,32 @@ def _build_trade_plan_prompt(
         "short":  "SHORT (sell)",
         "hedged": "HEDGED LONG (buy stock + protective put)",
     }[direction]
+
+    # ---- Existing position context block (only in "existing" mode) ----
+    existing_block = ""
+    if mode == "existing" and existing_position:
+        ep = existing_position
+        pnl_label   = "PROFIT" if ep["is_in_profit"] else "LOSS"
+        pnl_color   = "📈" if ep["is_in_profit"] else "📉"
+        tighter_lbl = "TIGHTER" if ep["algo_is_tighter"] else "LOOSER"
+
+        existing_block = (
+            f"\n## EXISTING POSITION (THIS IS A REPLAN, NOT A NEW ENTRY)\n\n"
+            f"The trader ALREADY HOLDS this position. They are NOT entering — "
+            f"they are asking how to manage the position they have.\n\n"
+            f"- Position: {ep['qty']} shares · entered at ₹{ep['entry_price']} · "
+            f"held for {ep['days_held']} days\n"
+            f"- Current spot: ₹{p['current_price']:.2f}\n"
+            f"- Unrealized {pnl_label}: {pnl_color} ₹{ep['unrealized_total']:,.0f} "
+            f"({ep['unrealized_per_share']:+.2f}/share = {ep['unrealized_pct']:+.2f}%)\n\n"
+            f"### TRADER'S CURRENT STOP vs ALGO'S RECOMMENDED STOP\n"
+            f"- TRADER'S STOP: ₹{ep['current_stop']:.2f} "
+            f"({ep['user_distance_pct']:+.2f}% from entry · loss if hit: ₹{ep['user_stop_loss_total']:,.0f})\n"
+            f"- ALGO RECOMMENDS: ₹{ep['algo_stop_price']:.2f} "
+            f"({ep['algo_distance_pct']:+.2f}% from entry · loss if hit: ₹{ep['algo_stop_loss_total']:,.0f})\n"
+            f"- Algo's stop is {tighter_lbl} than the trader's current stop\n"
+            f"- Algo's stop rationale: {ep['algo_stop_source']}\n"
+        )
 
     hedge_block = ""
     if direction == "hedged" and hedge:
@@ -2267,60 +2334,100 @@ def _build_trade_plan_prompt(
             f"- Mean target: ₹{pt.get('mean', '—')}\n"
         )
 
-    return f"""You are a senior trading desk strategist writing an execution memo for a
-retail Indian F&O trader who has decided to take a {direction_label} position in
-{symbol}. The numerical levels below have already been computed algorithmically.
-Your job is NOT to second-guess them — they're based on objective signals
-(ATR, OI strikes, SMAs, 52w levels). Your job is to write the COMMENTARY that
-explains WHY each level makes sense and WHAT TO WATCH FOR.
+    # ---- Task framing differs significantly based on mode ----
+    if mode == "existing":
+        intro = (
+            f"You are a senior trading desk strategist writing a POSITION MANAGEMENT memo "
+            f"for a retail Indian F&O trader who ALREADY HOLDS a {direction_label} position "
+            f"in {symbol}. They are NOT entering a new trade — they want to know how to "
+            f"MANAGE the position they're sitting in."
+        )
+        task_framing = (
+            "Your job is to advise on:\n"
+            "  1. Whether to KEEP the current stop or ADOPT the algo-recommended stop\n"
+            "  2. Whether to HOLD / TAKE PARTIAL PROFITS / EXIT FULLY at current spot\n"
+            "  3. What conditions would force an EARLY EXIT before any target hits\n"
+            "  4. Whether ADDING to the position makes sense from current spot\n"
+            "Do NOT discuss entry timing — they're already in. Do NOT discuss whether "
+            "the entry was a good idea — that's water under the bridge."
+        )
+    else:
+        intro = (
+            f"You are a senior trading desk strategist writing an execution memo for a "
+            f"retail Indian F&O trader who has decided to take a {direction_label} "
+            f"position in {symbol}. The numerical levels below have already been "
+            f"computed algorithmically. Your job is NOT to second-guess them — they're "
+            f"based on objective signals (ATR, OI strikes, SMAs, 52w levels). Your job "
+            f"is to write the COMMENTARY that explains WHY each level makes sense and "
+            f"WHAT TO WATCH FOR."
+        )
+        task_framing = ""
 
-## MARKET CONTEXT
-- Current price: ₹{p['current_price']:.2f}
-- ATR(14): ₹{levels['atr']:.2f}
-- 30D change: {p['pct_change_1d']:+.2f}% (today) · 1D: {p['pct_change_1d']:+.2f}%
-- RSI(14): {p['rsi_14']}
-- SMA 50/200: ₹{p.get('sma_50', 0):.2f} / ₹{p.get('sma_200', 0):.2f}
-- 52w range: ₹{p['low_52w']:.2f} – ₹{p['high_52w']:.2f}
-{options_block}{analyst_block}
+    # ---- Sections vary based on mode ----
+    if mode == "existing":
+        sections = """### Psychology Check
+Open with 2-3 sentences specific to managing this EXISTING position:
+- If in PROFIT: "Loss aversion will scream at you to take profit now. Don't unless T1 hit."
+- If in LOSS: "Don't widen the stop to 'give it room' — that's how small losses become big ones."
+- If held >10 days with no movement: "Opportunity cost is real. Set a time stop alongside the price stop."
+Then 2 universal reminders relevant to managing an existing trade
+(not entering one): journaling the deviation between plan vs execution,
+avoiding revenge after a stop-out, etc.
 
-## ALGORITHMIC TRADE PLAN (already computed)
+### Stop Loss Recommendation — KEEP CURRENT OR ADOPT ALGO STOP?
+This is the most important section. Pick ONE:
+- **"Keep your current stop at ₹X"** — explain why their stop is the right one
+- **"Adopt algo-recommended stop at ₹Y"** — explain why the algo's stop is better
 
-### Entry
-- Patient entry zone: ₹{entry['low']:.2f} – ₹{entry['high']:.2f}
-- Midpoint used for risk calc: ₹{entry['mid']:.2f}
+Cite the specific signal (SMA, OI level, ATR distance) that drives your choice.
+If user is in profit: also consider whether to TRAIL the stop closer to lock in gains.
+If user is in loss: consider whether the algo's stop is even still ahead of current spot.
 
-### Stop loss
-- Price: ₹{stop['price']:.2f} ({stop['distance_pct']:+.2f}% from entry)
-- Rationale: {stop['source']}
-- Risk per share: ₹{stop['risk_per_share']:.2f}
+### Hold / Partial Exit / Full Exit
+Given current spot vs T1/T2/T3 distances and the days held, recommend ONE:
+- **HOLD** — stay in, let the targets work
+- **PARTIAL EXIT** — book some now, hold the rest (specify what %)
+- **FULL EXIT** — exit the entire position now
+Justify with specific data: how far is current spot from T1? Is momentum still intact?
 
-### Position adds (averaging / scaling)
-- Add on adverse move: ₹{levels['add_zones']['adverse_1']:.2f}, ₹{levels['add_zones']['adverse_2']:.2f}
-- Add on confirmation: ₹{levels['add_zones']['confirm_1']:.2f}, ₹{levels['add_zones']['confirm_2']:.2f}
+### Adding to Position (Should you?)
+Given the user is already in at ₹{existing_entry if existing_position else '—'}, would adding
+make sense from current spot? Reference the algo's add zones but interpret them in
+light of the existing position's average price. If you'd add, specify the price level
+and the position-size impact on blended average.
 
-### Profit targets (ladder)
-- T1 (33% exit): ₹{tgts['t1']['price']:.2f} ({tgts['t1']['r_multiple']:.1f}R) — {tgts['t1']['rationale']}
-- T2 (33% exit): ₹{tgts['t2']['price']:.2f} ({tgts['t2']['r_multiple']:.1f}R) — {tgts['t2']['rationale']}
-- T3 (34% exit): ₹{tgts['t3']['price']:.2f} ({tgts['t3']['r_multiple']:.1f}R) — {tgts['t3']['rationale']}
+### Forward Targets (recalculated from your entry)
+For each of T1/T2/T3:
+- One sentence on what catalyst/condition would get price there
+- The R-multiple shown is now measured from YOUR ACTUAL ENTRY, not the algo midpoint
+- Specifically call out which target makes the most sense to scale out at
 
-### Position economics
-- Quantity: {econ['qty']} shares
-- Capital deployed: ₹{econ['capital_required']:,.0f}
-- Total risk: ₹{econ['effective_risk']:,.0f}
-- Max reward (all targets): ₹{econ['max_reward']:,.0f}
-- Risk:Reward ratio: 1:{econ['risk_reward_ratio']:.2f}
-{hedge_block}
+### Time Stop Considerations
+Given the position has been held {existing_position['days_held'] if existing_position else 0} days:
+- Is this trade on schedule? (compare days held to ATR-implied time to target)
+- What's the "time stop" rule: if no progress in X more days, exit?
+- For F&O traders: how does monthly expiry affect this decision?
 
-## YOUR TASK
+### Watch List (3-4 bullets)
+- Earnings dates / events that would force re-evaluation
+- Price levels that should trigger immediate action (above or below)
+- Volume + OI shifts that would change the picture
+- Specific to {direction.upper()}: """ + (
+            "Don't unwind the hedge early just because it's 'unused'. Roll only if put strikes drift far from spot." if direction == "hedged"
+            else "Short-squeeze risk. Spot it via volume spike + gap up + supportive news." if direction == "short"
+            else "Time decay: if 5 more trading days pass with no progress toward T1, time-stop the position."
+        ) + """
 
-Write a focused execution memo in markdown with these EXACT sections (no introduction,
-no preamble — start straight with the first heading):
-
-### Psychology Check
+### Important Caveats
+- 2-3 honest risks that the algorithmic plan doesn't account for
+- The trader's entry is FIXED — none of this advice changes that cost basis
+- Acknowledge what's unknowable (gap risk, news shocks, etc.)"""
+    else:
+        sections = """### Psychology Check
 This is the FIRST section because mental discipline matters more than perfect entries.
 Write 2 parts:
 1. **Setup-specific psychology (2-3 sentences)**: Identify the SPECIFIC emotional traps
-   this {direction_label} setup will trigger for the trader. Examples to draw from:
+   this """ + direction_label + """ setup will trigger for the trader. Examples to draw from:
    - LONG at extended price: "First 1% gain will feel like 'easy money, take it now'. Don't."
    - LONG below SMA 200: "When it bounces 3% and stalls, you'll feel vindicated and add too early."
    - SHORT against bullish consensus: "Every broker upgrade will make you question the thesis."
@@ -2363,11 +2470,60 @@ high-probability setup.
 - Specific events to monitor: earnings dates if approaching, F&O expiry day, sector news
 - Price levels that would force re-evaluation BEFORE the stop hits
 - Volume conditions that would confirm/invalidate the move
-- {("If hedged: note any condition where the hedge becomes unnecessary" if direction == "hedged" else "If short: explicitly note short-squeeze risk and how to spot it" if direction == "short" else "Time decay: if the trade goes nowhere for N trading days, what's the rule?")}
+- """ + (
+            "If hedged: note any condition where the hedge becomes unnecessary" if direction == "hedged"
+            else "If short: explicitly note short-squeeze risk and how to spot it" if direction == "short"
+            else "Time decay: if the trade goes nowhere for N trading days, what's the rule?"
+        ) + """
 
 ### Important Caveats
 - 2-3 honest risks that the algorithmic plan doesn't account for
-- Acknowledge what's unknowable (gap risk, news shocks, etc.)
+- Acknowledge what's unknowable (gap risk, news shocks, etc.)"""
+
+    return f"""{intro}{(' ' + task_framing) if task_framing else ''}
+
+## MARKET CONTEXT
+- Current price: ₹{p['current_price']:.2f}
+- ATR(14): ₹{levels['atr']:.2f}
+- 30D change: {p['pct_change_1d']:+.2f}% (today) · 1D: {p['pct_change_1d']:+.2f}%
+- RSI(14): {p['rsi_14']}
+- SMA 50/200: ₹{p.get('sma_50', 0):.2f} / ₹{p.get('sma_200', 0):.2f}
+- 52w range: ₹{p['low_52w']:.2f} – ₹{p['high_52w']:.2f}
+{options_block}{analyst_block}{existing_block}
+
+## ALGORITHMIC TRADE PLAN (already computed)
+
+### Entry
+{'- Existing entry (FIXED): ₹' + f"{entry['mid']:.2f}" + ' — you are already in at this price' if mode == 'existing' else '- Patient entry zone: ₹' + f"{entry['low']:.2f}" + ' – ₹' + f"{entry['high']:.2f}" + chr(10) + '- Midpoint used for risk calc: ₹' + f"{entry['mid']:.2f}"}
+
+### Stop loss
+- Price: ₹{stop['price']:.2f} ({stop['distance_pct']:+.2f}% from {'YOUR entry' if mode == 'existing' else 'entry'})
+- Rationale: {stop['source']}
+- Risk per share: ₹{stop['risk_per_share']:.2f}
+
+### Position adds (averaging / scaling)
+- Add on adverse move: ₹{levels['add_zones']['adverse_1']:.2f}, ₹{levels['add_zones']['adverse_2']:.2f}
+- Add on confirmation: ₹{levels['add_zones']['confirm_1']:.2f}, ₹{levels['add_zones']['confirm_2']:.2f}
+
+### Profit targets (ladder, R-multiples measured from {'YOUR entry' if mode == 'existing' else 'entry midpoint'})
+- T1 (33% exit): ₹{tgts['t1']['price']:.2f} ({tgts['t1']['r_multiple']:.1f}R) — {tgts['t1']['rationale']}
+- T2 (33% exit): ₹{tgts['t2']['price']:.2f} ({tgts['t2']['r_multiple']:.1f}R) — {tgts['t2']['rationale']}
+- T3 (34% exit): ₹{tgts['t3']['price']:.2f} ({tgts['t3']['r_multiple']:.1f}R) — {tgts['t3']['rationale']}
+
+### Position economics
+- Quantity: {econ['qty']} shares
+- Capital deployed: ₹{econ['capital_required']:,.0f}
+- Total risk: ₹{econ['effective_risk']:,.0f}
+- Max reward (all targets): ₹{econ['max_reward']:,.0f}
+- Risk:Reward ratio: 1:{econ['risk_reward_ratio']:.2f}
+{hedge_block}
+
+## YOUR TASK
+
+Write a focused {'POSITION MANAGEMENT' if mode == 'existing' else 'execution'} memo in markdown with these EXACT sections (no introduction,
+no preamble — start straight with the first heading):
+
+{sections}
 
 Tone: direct, no fluff, no hype, no "this is going to be great". Indian F&O trader,
 serious about discipline. Use specific ₹ values when relevant. Maximum 750 words total."""
@@ -2385,6 +2541,16 @@ def get_trade_plan():
         "input_mode":  "qty" | "capital",
         "qty":         100,           # required if input_mode == "qty"
         "capital":     250000.0,      # required if input_mode == "capital"
+
+        # ===== Existing position mode (optional) =====
+        # When `mode == "existing"`, the API treats the trader as already
+        # in the position and replans around their actual entry — showing
+        # unrealized P&L, comparing their stop vs algo stop, computing
+        # P&L at each target from their actual cost basis.
+        "mode":            "new" | "existing",   # default: "new"
+        "existing_entry":  2450.50,              # required if mode == "existing"
+        "existing_stop":   2380.00,              # required if mode == "existing"
+        "days_held":       12,                   # required if mode == "existing"
       }
     """
     if not anthropic_client:
@@ -2392,7 +2558,7 @@ def get_trade_plan():
 
     body = request.get_json(silent=True) or {}
 
-    # --- Input validation ---
+    # --- Input validation: core fields ---
     symbol = (body.get("symbol") or "").strip().upper()
     if not symbol:
         return jsonify({"error": "symbol required"}), 400
@@ -2424,8 +2590,60 @@ def get_trade_plan():
         if capital <= 0:
             return jsonify({"error": "capital must be > 0"}), 400
 
-    logger.info("Trade plan for %s (%s, %s=%s)",
-                symbol, direction, input_mode, qty or capital)
+    # --- Input validation: existing-position fields (optional) ---
+    mode = (body.get("mode") or "new").strip().lower()
+    if mode not in ("new", "existing"):
+        return jsonify({"error": "mode must be 'new' or 'existing'"}), 400
+
+    existing_entry = None
+    existing_stop  = None
+    days_held      = None
+    if mode == "existing":
+        # Existing-position mode requires entry + stop + days_held; qty was
+        # already collected above (it represents the user's current position size).
+        if input_mode == "capital":
+            return jsonify({
+                "error": "existing_requires_qty",
+                "message": "Existing position mode requires Quantity input (not capital).",
+            }), 400
+        try:
+            existing_entry = float(body.get("existing_entry", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "existing_entry must be a number"}), 400
+        if existing_entry <= 0:
+            return jsonify({"error": "existing_entry must be > 0"}), 400
+
+        try:
+            existing_stop = float(body.get("existing_stop", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "existing_stop must be a number"}), 400
+        if existing_stop <= 0:
+            return jsonify({"error": "existing_stop must be > 0"}), 400
+
+        # Validate stop is on the correct side of entry for the direction
+        is_long = direction in ("long", "hedged")
+        if is_long and existing_stop >= existing_entry:
+            return jsonify({
+                "error": "stop_wrong_side",
+                "message": f"For LONG position, stop (₹{existing_stop}) must be BELOW entry (₹{existing_entry}).",
+            }), 400
+        if not is_long and existing_stop <= existing_entry:
+            return jsonify({
+                "error": "stop_wrong_side",
+                "message": f"For SHORT position, stop (₹{existing_stop}) must be ABOVE entry (₹{existing_entry}).",
+            }), 400
+
+        try:
+            days_held = int(body.get("days_held", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "days_held must be an integer"}), 400
+        if days_held < 0:
+            return jsonify({"error": "days_held must be >= 0"}), 400
+
+    logger.info(
+        "Trade plan for %s (%s, %s, %s=%s, days_held=%s)",
+        symbol, direction, mode, input_mode, qty or capital, days_held,
+    )
 
     # --- Fetch market data in parallel ---
     price_data = _fetch_price_data(symbol)
@@ -2448,7 +2666,7 @@ def get_trade_plan():
                         f"protective put. Choose Long or Short direction instead."),
         }), 400
 
-    # --- Compute algorithmic levels ---
+    # --- Compute algorithmic levels (always done — used to recommend stop, targets) ---
     levels = _compute_trade_levels(direction, price_data, options_data, ratings)
 
     # If user provided capital instead of qty, derive qty from capital + entry midpoint
@@ -2461,6 +2679,68 @@ def get_trade_plan():
                 "message": (f"Capital ₹{capital:,.0f} is less than 1 share of "
                             f"{symbol} at ₹{entry_mid:.2f}. Increase capital or use qty input."),
             }), 400
+
+    # ----- EXISTING POSITION MODE: rewrite "entry" to user's actual entry -----
+    # This affects the targets/economics calculations downstream so P&L is
+    # measured from the user's real cost basis, not the algorithmic midpoint.
+    # We also stash the algo stop separately so the AI can compare both.
+    algo_stop = levels["stop_loss"].copy()  # preserve original for comparison
+    existing_position = None
+
+    if mode == "existing":
+        # Replace entry zone with the user's fixed entry
+        levels["entry_zone"] = {
+            "low":  round(existing_entry, 2),
+            "mid":  round(existing_entry, 2),
+            "high": round(existing_entry, 2),
+            "is_fixed": True,
+        }
+        # Recompute targets relative to user's entry (so R-multiples are honest)
+        levels = _recompute_targets_from_entry(levels, existing_entry, direction)
+
+        # Build the existing-position context block
+        is_long = direction in ("long", "hedged")
+        unrealized_per_share = (current_price - existing_entry) if is_long else (existing_entry - current_price)
+        unrealized_total     = unrealized_per_share * qty
+        unrealized_pct       = (unrealized_per_share / existing_entry * 100)
+
+        # User's stop in P&L terms
+        user_stop_loss_per_share = abs(existing_entry - existing_stop)
+        user_stop_loss_total     = user_stop_loss_per_share * qty
+
+        # Algo's recommended stop in P&L terms (from user's actual entry)
+        algo_stop_loss_per_share = abs(existing_entry - algo_stop["price"])
+        algo_stop_loss_total     = algo_stop_loss_per_share * qty
+
+        # Compare: is algo's stop tighter/looser than user's?
+        if is_long:
+            algo_is_tighter = algo_stop["price"] > existing_stop
+        else:
+            algo_is_tighter = algo_stop["price"] < existing_stop
+
+        existing_position = {
+            "entry_price":              round(existing_entry, 2),
+            "current_stop":             round(existing_stop, 2),
+            "days_held":                days_held,
+            "qty":                      qty,
+            "unrealized_per_share":     round(unrealized_per_share, 2),
+            "unrealized_total":         round(unrealized_total, 2),
+            "unrealized_pct":           round(unrealized_pct, 2),
+            "is_in_profit":             unrealized_per_share > 0,
+            "user_stop_loss_per_share": round(user_stop_loss_per_share, 2),
+            "user_stop_loss_total":     round(user_stop_loss_total, 2),
+            "algo_stop_price":          round(algo_stop["price"], 2),
+            "algo_stop_source":         algo_stop["source"],
+            "algo_stop_loss_per_share": round(algo_stop_loss_per_share, 2),
+            "algo_stop_loss_total":     round(algo_stop_loss_total, 2),
+            "algo_is_tighter":          algo_is_tighter,
+            "algo_distance_pct":        round((algo_stop["price"] - existing_entry) / existing_entry * 100, 2),
+            "user_distance_pct":        round((existing_stop - existing_entry) / existing_entry * 100, 2),
+        }
+
+        # Update levels.stop_loss to reflect the ALGO recommendation (the AI's
+        # input). Frontend uses both `algo_stop` from existing_position and
+        # `current_stop` to show side-by-side.
 
     # --- Compute hedge leg (if hedged) ---
     hedge = None
@@ -2475,12 +2755,16 @@ def get_trade_plan():
             }), 400
 
     # --- Compute position economics ---
+    # For existing mode, economics uses the user's actual entry (already
+    # written into levels.entry_zone above) and the ALGO stop (the
+    # forward-looking risk if user adopts the new stop).
     econ = _compute_position_economics(levels, qty, lot_size, hedge)
 
     # --- AI commentary ---
     prompt = _build_trade_plan_prompt(
         symbol, direction, levels, econ, hedge,
         price_data, options_data, ratings,
+        mode=mode, existing_position=existing_position,
     )
 
     try:
@@ -2497,16 +2781,18 @@ def get_trade_plan():
         return jsonify({"error": f"AI commentary failed: {str(e)}"}), 500
 
     return jsonify({
-        "symbol":         symbol,
-        "analyzed_at":    datetime.utcnow().isoformat() + "Z",
-        "direction":      direction,
-        "input_mode":     input_mode,
-        "lot_size":       lot_size,
-        "levels":         levels,
-        "economics":      econ,
-        "hedge":          hedge,
-        "ai_commentary":  ai_text,
-        "model":          ANTHROPIC_MODEL,
+        "symbol":             symbol,
+        "analyzed_at":        datetime.utcnow().isoformat() + "Z",
+        "direction":          direction,
+        "input_mode":         input_mode,
+        "mode":               mode,
+        "lot_size":           lot_size,
+        "levels":             levels,
+        "economics":          econ,
+        "hedge":              hedge,
+        "existing_position":  existing_position,
+        "ai_commentary":      ai_text,
+        "model":              ANTHROPIC_MODEL,
     }), 200
 
 
