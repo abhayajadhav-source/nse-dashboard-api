@@ -2510,5 +2510,446 @@ def get_trade_plan():
     }), 200
 
 
+# ===========================================================================
+# PEER COMPARISON — find better alternatives aligned with the trade plan
+# ===========================================================================
+#
+# Endpoint: POST /api/peer-comparison
+# Body: { symbol, direction ("long"|"short"|"hedged") }
+#
+# Returns full data for the original symbol + 3 peer stocks, plus an AI
+# verdict ranking them all and flagging which is the best fit for the
+# selected trade direction.
+#
+# Peer selection: hardcoded PEER_MAP first, fall back to Yahoo sector tag.
+# ===========================================================================
+
+from peer_map import get_peers as _get_hardcoded_peers
+
+
+def _resolve_peers(symbol: str, max_peers: int = 3) -> tuple[list[str], str]:
+    """
+    Find up to `max_peers` peer stocks for the given symbol.
+
+    Strategy:
+      1. Hardcoded peer map (fast, accurate for major stocks)
+      2. Fall back to Yahoo sector matching (any stock in same NSE_STOCKS
+         universe with same sector tag)
+
+    Returns: (list of peer symbols, source string for logging/UI)
+    """
+    # Strategy 1: hardcoded map
+    mapped = _get_hardcoded_peers(symbol)
+    if mapped:
+        return mapped[:max_peers], "hardcoded_map"
+
+    # Strategy 2: sector-based fallback via Yahoo
+    try:
+        info = yf.Ticker(f"{symbol}.NS").info or {}
+        my_sector = info.get("sector") or ""
+        my_industry = info.get("industry") or ""
+        if not (my_sector or my_industry):
+            return [], "no_sector_data"
+
+        # Iterate the F&O universe and find same-sector stocks
+        candidates = []
+        for other_sym in NSE_LOT_SIZES.keys():
+            if other_sym == symbol:
+                continue
+            try:
+                other_info = yf.Ticker(f"{other_sym}.NS").info or {}
+                other_sector = other_info.get("sector") or ""
+                other_industry = other_info.get("industry") or ""
+                # Prefer industry match (tighter); fall back to sector match
+                if my_industry and other_industry == my_industry:
+                    candidates.append((other_sym, 2))   # priority 2 = same industry
+                elif my_sector and other_sector == my_sector:
+                    candidates.append((other_sym, 1))   # priority 1 = same sector only
+                if len(candidates) >= max_peers * 2:
+                    break  # don't over-search
+            except Exception:
+                continue
+
+        candidates.sort(key=lambda c: -c[1])  # higher priority first
+        return [c[0] for c in candidates[:max_peers]], "sector_fallback"
+
+    except Exception as e:
+        logger.warning("Peer resolution failed for %s: %s", symbol, e)
+        return [], "error"
+
+
+def _fetch_full_stock_bundle(symbol: str) -> Optional[dict]:
+    """
+    Fetch the same data set as /api/analyze for one symbol — price + options
+    + analyst ratings + news. Returns None if price fetch fails.
+    """
+    price_data = _fetch_price_data(symbol)
+    if price_data is None:
+        return None
+
+    current_price = price_data["current_price"]
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_ratings = executor.submit(_fetch_analyst_ratings, symbol)
+        future_options = executor.submit(fetch_options_data, symbol, current_price)
+        future_news    = executor.submit(_fetch_news, symbol, 3)
+
+        ratings      = future_ratings.result()
+        options_data = future_options.result()
+        news         = future_news.result()
+
+    # Serialize options for the response (same shape as /api/analyze)
+    options_payload = None
+    if options_data is not None:
+        options_payload = {
+            "expiry_date":       options_data.expiry_date,
+            "pcr_oi":            round(options_data.pcr_oi, 2),
+            "max_pain":          round(options_data.max_pain, 2),
+            "pcr_signal":        options_data.pcr_signal,
+            "buildup_signal":    options_data.buildup_signal,
+            "composite_signal":  options_data.composite_signal,
+            "composite_strength": options_data.composite_strength,
+            "highest_call_oi_strike": options_data.highest_call_oi_strike,
+            "highest_put_oi_strike":  options_data.highest_put_oi_strike,
+        }
+
+    return {
+        "symbol":      symbol,
+        "price":       price_data,
+        "options":     options_payload,
+        "ratings":     ratings,
+        "news":        news,
+    }
+
+
+def _score_stock_for_direction(bundle: dict, direction: str) -> float:
+    """
+    Compute a simple alignment score (0-10) for how well this stock fits the
+    chosen trade direction. AI gets this as a hint but is free to disagree.
+
+    LONG-favoring signals (positive contribution):
+      - RSI 40-65 (not overbought, room to run)
+      - Price above SMA 50
+      - Positive 30D change (momentum)
+      - PCR > 1 (bullish options)
+      - Composite signal bullish
+      - Volume above average
+      - Analyst consensus buy/strong buy
+      - High Put OI support nearby
+
+    SHORT-favoring signals: mirror image.
+    HEDGED: same as LONG but penalize stocks with NO F&O (can't hedge).
+    """
+    p = bundle.get("price") or {}
+    opt = bundle.get("options")
+    ratings = bundle.get("ratings") or {}
+
+    score = 5.0  # neutral baseline
+    is_long_aligned = direction in ("long", "hedged")
+    mult = 1 if is_long_aligned else -1
+
+    # RSI alignment
+    rsi = p.get("rsi_14") or 50
+    if is_long_aligned:
+        if 40 <= rsi <= 65: score += 1.0
+        elif rsi > 70:      score -= 0.5
+        elif rsi < 35:      score += 0.5   # oversold can mean bounce setup
+    else:
+        if 35 <= rsi <= 60: score += 1.0
+        elif rsi < 30:      score -= 0.5
+        elif rsi > 65:      score += 0.5   # overbought = short setup
+
+    # Trend alignment (price vs SMA 50)
+    price = p.get("current_price", 0)
+    sma50 = p.get("sma_50", 0)
+    if sma50 > 0 and price > 0:
+        pct_from_sma = (price - sma50) / sma50 * 100
+        score += mult * min(max(pct_from_sma / 5, -1.5), 1.5)  # clamp at ±1.5
+
+    # Momentum (30D change)
+    chg_30d = p.get("pct_change_30d") or 0
+    score += mult * min(max(chg_30d / 15, -1.0), 1.0)  # clamp at ±1
+
+    # Options sentiment
+    if opt:
+        comp = (opt.get("composite_signal") or "").lower()
+        if "strong bull" in comp:    score += mult * 1.2
+        elif "bull" in comp:         score += mult * 0.6
+        elif "strong bear" in comp:  score -= mult * 1.2
+        elif "bear" in comp:         score -= mult * 0.6
+
+        pcr = opt.get("pcr_oi") or 1.0
+        if is_long_aligned:
+            if pcr > 1.3:   score += 0.6
+            elif pcr < 0.7: score -= 0.6
+        else:
+            if pcr < 0.7:   score += 0.6
+            elif pcr > 1.3: score -= 0.6
+    elif direction == "hedged":
+        # Can't hedge without options — heavy penalty
+        score -= 2.0
+
+    # Volume confirmation
+    vol_ratio = p.get("volume_ratio") or 1
+    if vol_ratio > 1.5:
+        score += mult * 0.5
+
+    # Analyst consensus
+    consensus = (ratings.get("consensus") or "").lower()
+    if "strong buy" in consensus:    score += mult * 0.8
+    elif "buy" in consensus:         score += mult * 0.4
+    elif "strong sell" in consensus: score -= mult * 0.8
+    elif "sell" in consensus:        score -= mult * 0.4
+
+    return round(max(0, min(10, score)), 2)
+
+
+def _build_peer_comparison_prompt(
+    target_bundle: dict, peer_bundles: list, direction: str, scores: dict,
+) -> str:
+    """Build AI prompt that ranks all stocks against the chosen direction."""
+    direction_label = {
+        "long":   "LONG (buy)",
+        "short":  "SHORT (sell)",
+        "hedged": "HEDGED LONG (buy stock + protective put)",
+    }[direction]
+
+    def _format_stock(bundle):
+        p = bundle["price"]
+        opt = bundle.get("options")
+        ratings = bundle.get("ratings") or {}
+        sym = bundle["symbol"]
+        sc = scores.get(sym, "?")
+
+        lines = [
+            f"### {sym} (alignment score {sc}/10)",
+            f"- Current price: ₹{p['current_price']:.2f}",
+            f"- RSI(14): {p['rsi_14']:.1f}",
+            f"- 1D / 30D: {p['pct_change_1d']:+.2f}% / {p['pct_change_30d']:+.2f}%",
+            f"- 52w range: ₹{p['low_52w']:.0f} – ₹{p['high_52w']:.0f}",
+            f"- SMA 50: ₹{p.get('sma_50', 0):.2f} (price is "
+            f"{((p['current_price'] - p.get('sma_50', p['current_price'])) / max(p.get('sma_50', 1), 1) * 100):+.2f}% from SMA50)",
+            f"- ATR(14): ₹{p.get('atr_14', 0):.2f}",
+            f"- Volume: {p['volume_ratio']:.1f}x avg",
+        ]
+        if opt:
+            lines += [
+                f"- Options PCR: {opt['pcr_oi']:.2f} ({opt['pcr_signal']})",
+                f"- Composite signal: {opt['composite_signal']} "
+                f"({opt['composite_strength']}/5)",
+                f"- Resistance / Support: ₹{opt['highest_call_oi_strike']:.0f} "
+                f"/ ₹{opt['highest_put_oi_strike']:.0f}",
+            ]
+        else:
+            lines.append("- Options: NOT IN F&O SEGMENT")
+
+        if ratings and ratings.get("price_target"):
+            pt = ratings["price_target"]
+            tgt = pt.get("mean")
+            cons = ratings.get("consensus", "—")
+            if tgt:
+                upside = (tgt - p['current_price']) / p['current_price'] * 100
+                lines.append(f"- Analyst: {cons}, target ₹{tgt:.0f} ({upside:+.1f}%)")
+            else:
+                lines.append(f"- Analyst: {cons}")
+
+        if bundle.get("news"):
+            news_titles = " · ".join(n.get("title", "")[:80] for n in bundle["news"][:2])
+            lines.append(f"- Recent news: {news_titles}")
+
+        return "\n".join(lines)
+
+    target_section = _format_stock(target_bundle)
+    peer_sections = "\n\n".join(_format_stock(b) for b in peer_bundles)
+
+    return f"""You are a senior portfolio manager helping a retail F&O trader compare
+{target_bundle['symbol']} against its closest peers for a {direction_label} trade.
+
+The trader is currently planning to take {direction_label} on {target_bundle['symbol']}.
+Your job: rank ALL 4 stocks (target + peers) for how well each fits THIS specific
+direction RIGHT NOW, given the data below.
+
+## TARGET STOCK (currently chosen)
+
+{target_section}
+
+## PEER STOCKS (for comparison)
+
+{peer_sections}
+
+## YOUR TASK
+
+Write the comparison memo in markdown with these EXACT sections:
+
+### Verdict
+ONE line at the top: which stock is the best {direction_label} setup RIGHT NOW?
+Use this exact format:
+**Best fit: SYMBOL** — one-line reason citing the strongest signal.
+
+If the target stock {target_bundle['symbol']} is the best, say so clearly:
+**Best fit: {target_bundle['symbol']} (your selection)** — and explain why.
+
+If a peer is better, say:
+**Best fit: SYMBOL (better than your selection of {target_bundle['symbol']})** — and
+explain WHY the peer is better.
+
+### Ranked Comparison
+Rank all 4 stocks 1-4 for {direction_label} alignment. For each:
+- Show the alignment score
+- 2 sentences explaining what's working / what's not
+- One specific data point that drives the rank (e.g., "RSI 78 is too hot for entry here")
+
+### Why {target_bundle['symbol']} {"wins" if target_bundle else "loses"} vs peers
+Honest 3-4 sentence assessment:
+- If {target_bundle['symbol']} ranks #1: confirm what makes it the best pick
+- If it doesn't: state plainly which peer is stronger and on what metric
+
+### Setup Differences That Matter
+Where the peers diverge from {target_bundle['symbol']} in ways that affect THIS trade:
+- One bullet per material difference (RSI, trend stage, options sentiment, valuation)
+- Max 4 bullets
+
+### Switching Considerations
+Should the trader actually switch from {target_bundle['symbol']} to the top-ranked peer?
+- If yes: what specifically would you do differently in the trade plan
+- If no: why staying with {target_bundle['symbol']} is still defensible
+
+### Honest Caveats
+- 2 bullets: what this comparison DOESN'T capture (e.g., position already opened,
+  tax implications, sector concentration in user's portfolio)
+- Acknowledge analyst data may be sparse for some peers
+
+Tone: direct, decisive, no fluff. Use specific numbers from the data. If the target
+stock IS the best pick, don't manufacture reasons to switch. If a peer is genuinely
+better, say so clearly. Max 700 words."""
+
+
+@app.route("/api/peer-comparison", methods=["POST"])
+def get_peer_comparison():
+    """
+    Compare the target stock against 3 peer stocks for a chosen direction.
+
+    Body:
+      {
+        "symbol":    "HDFCBANK",
+        "direction": "long" | "short" | "hedged",
+      }
+    """
+    if not anthropic_client:
+        return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
+
+    body = request.get_json(silent=True) or {}
+
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    if not all(c.isalnum() or c in "&-" for c in symbol):
+        return jsonify({"error": "invalid symbol"}), 400
+
+    direction = (body.get("direction") or "long").strip().lower()
+    if direction not in ("long", "short", "hedged"):
+        return jsonify({"error": "direction must be 'long', 'short', or 'hedged'"}), 400
+
+    logger.info("Peer comparison for %s (%s)", symbol, direction)
+
+    # --- Resolve peers ---
+    peer_symbols, source = _resolve_peers(symbol, max_peers=3)
+    logger.info("Peers for %s: %s (source: %s)", symbol, peer_symbols, source)
+
+    if not peer_symbols:
+        return jsonify({
+            "error":   "no_peers_found",
+            "message": (f"Could not find peer stocks for {symbol}. "
+                        f"Not in our peer map and Yahoo sector lookup also failed."),
+        }), 404
+
+    # --- Fetch target + peers in parallel ---
+    # We use ThreadPoolExecutor with 4 workers (target + up to 3 peers).
+    # Each _fetch_full_stock_bundle is itself parallel (3 workers internally for
+    # options/ratings/news), so total worker count is 4 * 3 = 12 — manageable.
+    all_symbols = [symbol] + peer_symbols
+    bundles: dict = {}
+
+    with ThreadPoolExecutor(max_workers=len(all_symbols)) as executor:
+        futures = {executor.submit(_fetch_full_stock_bundle, s): s for s in all_symbols}
+        for future in futures:
+            sym = futures[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    bundles[sym] = result
+            except Exception as e:
+                logger.warning("Bundle fetch failed for %s: %s", sym, e)
+
+    if symbol not in bundles:
+        return jsonify({
+            "error":   "target_fetch_failed",
+            "message": f"Could not fetch data for {symbol}",
+        }), 404
+
+    target_bundle = bundles[symbol]
+    peer_bundles  = [bundles[s] for s in peer_symbols if s in bundles]
+
+    if not peer_bundles:
+        return jsonify({
+            "error":   "all_peers_failed",
+            "message": (f"Could not fetch data for any of the peer stocks: {peer_symbols}. "
+                        f"Yahoo may be rate-limiting."),
+        }), 503
+
+    # --- Score each stock for the chosen direction ---
+    scores = {s: _score_stock_for_direction(bundles[s], direction) for s in bundles}
+
+    # --- AI verdict ---
+    prompt = _build_peer_comparison_prompt(target_bundle, peer_bundles, direction, scores)
+
+    try:
+        response = anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        ai_text = "".join(
+            block.text for block in response.content if hasattr(block, "text")
+        )
+    except Exception as e:
+        logger.exception("Anthropic API call failed: %s", e)
+        return jsonify({"error": f"AI verdict failed: {str(e)}"}), 500
+
+    # --- Serialize the response ---
+    def _summarize_bundle(b):
+        p = b["price"]
+        opt = b.get("options")
+        ratings = b.get("ratings") or {}
+        return {
+            "symbol":          b["symbol"],
+            "alignment_score": scores.get(b["symbol"], 0),
+            "current_price":   p["current_price"],
+            "pct_change_1d":   p["pct_change_1d"],
+            "pct_change_30d":  p["pct_change_30d"],
+            "rsi_14":          p["rsi_14"],
+            "volume_ratio":    p["volume_ratio"],
+            "high_52w":        p["high_52w"],
+            "low_52w":         p["low_52w"],
+            "sma_50":          p.get("sma_50"),
+            "atr_14":          p.get("atr_14"),
+            "options":         opt,
+            "consensus":       ratings.get("consensus"),
+            "price_target":    ratings.get("price_target"),
+        }
+
+    return jsonify({
+        "target":         symbol,
+        "direction":      direction,
+        "peer_source":    source,
+        "analyzed_at":    datetime.utcnow().isoformat() + "Z",
+        "target_bundle":  _summarize_bundle(target_bundle),
+        "peer_bundles":   [_summarize_bundle(b) for b in peer_bundles],
+        "scores":         scores,
+        "ai_verdict":     ai_text,
+        "model":          ANTHROPIC_MODEL,
+    }), 200
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
