@@ -2254,6 +2254,7 @@ def _build_trade_plan_prompt(
     ratings: Optional[dict],
     mode: str = "new",
     existing_position: Optional[dict] = None,
+    scoreboard: Optional[list[dict]] = None,
 ) -> str:
     """
     Build a focused AI prompt — algo already computed the numbers, AI just
@@ -2332,6 +2333,23 @@ def _build_trade_plan_prompt(
             f"\n## ANALYST VIEW\n"
             f"- Consensus: {ratings.get('consensus', '—')}\n"
             f"- Mean target: ₹{pt.get('mean', '—')}\n"
+        )
+
+    # ---- Scoreboard block — the algorithm computed verdicts; AI fills reasons ----
+    scoreboard_block = ""
+    if scoreboard:
+        verdict_emoji = {"favorable": "✓ FOR", "against": "✗ AGAINST", "neutral": "~ NEUTRAL"}
+        rows_text = "\n".join(
+            f"- {r['bucket']} · {r['factor']} = {r['value']} → {verdict_emoji.get(r['verdict'], r['verdict'])}"
+            for r in scoreboard
+        )
+        scoreboard_block = (
+            f"\n## SCOREBOARD (algorithm-computed verdicts for {direction_label})\n\n"
+            f"Each factor has been algorithmically classified as FAVORABLE, "
+            f"AGAINST, or NEUTRAL for the chosen direction. YOUR JOB is to "
+            f"write a one-line reason for each row in the SCOREBOARD_REASONS "
+            f"section at the END of your response (see instructions below).\n\n"
+            f"{rows_text}\n"
         )
 
     # ---- Task framing differs significantly based on mode ----
@@ -2489,7 +2507,7 @@ high-probability setup.
 - RSI(14): {p['rsi_14']}
 - SMA 50/200: ₹{p.get('sma_50', 0):.2f} / ₹{p.get('sma_200', 0):.2f}
 - 52w range: ₹{p['low_52w']:.2f} – ₹{p['high_52w']:.2f}
-{options_block}{analyst_block}{existing_block}
+{options_block}{analyst_block}{existing_block}{scoreboard_block}
 
 ## ALGORITHMIC TRADE PLAN (already computed)
 
@@ -2525,8 +2543,28 @@ no preamble — start straight with the first heading):
 
 {sections}
 
+## CRITICAL — FINAL SECTION: SCOREBOARD_REASONS
+
+After all the prose sections above, you MUST include this final section EXACTLY
+in this format (parseable by the system, NOT shown to the user):
+
+## SCOREBOARD_REASONS
+Factor name 1: one-line reason (≤ 18 words)
+Factor name 2: one-line reason (≤ 18 words)
+...
+
+Rules for the reasons:
+- Use the EXACT factor names from the SCOREBOARD section above
+  (e.g. "RSI(14)", "Price vs SMA 50", "PCR (OI)", "Promoter holding")
+- One line each, no markdown, no bullets, just "factor: reason"
+- Be specific to the current value (don't write generic things like "this is bullish")
+- For FAVORABLE rows: explain why this specific reading helps the {direction.upper()} thesis
+- For AGAINST rows: explain why this specific reading hurts the {direction.upper()} thesis
+- For NEUTRAL rows: explain why it's not a strong signal either way
+- Keep each reason under 18 words — these render in a table cell
+
 Tone: direct, no fluff, no hype, no "this is going to be great". Indian F&O trader,
-serious about discipline. Use specific ₹ values when relevant. Maximum 750 words total."""
+serious about discipline. Use specific ₹ values when relevant. Maximum 900 words total."""
 
 
 @app.route("/api/trade-plan", methods=["POST"])
@@ -2652,11 +2690,14 @@ def get_trade_plan():
 
     current_price = price_data["current_price"]
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    # Parallel fetch: ratings, options, fundamentals (latter is cached 7 days)
+    with ThreadPoolExecutor(max_workers=3) as executor:
         future_ratings = executor.submit(_fetch_analyst_ratings, symbol)
         future_options = executor.submit(fetch_options_data, symbol, current_price)
+        future_fundamentals = executor.submit(get_fundamentals, symbol) if FUNDAMENTALS_AVAILABLE else None
         ratings      = future_ratings.result()
         options_data = future_options.result()
+        fundamentals = future_fundamentals.result() if future_fundamentals else None
 
     # Hedged direction requires options data — fail gracefully if unavailable
     if direction == "hedged" and not options_data:
@@ -2760,17 +2801,22 @@ def get_trade_plan():
     # forward-looking risk if user adopts the new stop).
     econ = _compute_position_economics(levels, qty, lot_size, hedge)
 
+    # --- Build scoreboard (algorithmic verdicts; AI fills reasons) ---
+    scoreboard = _build_scoreboard(direction, price_data, options_data, ratings, fundamentals)
+    scoreboard_summary = _summarize_scoreboard(scoreboard)
+
     # --- AI commentary ---
     prompt = _build_trade_plan_prompt(
         symbol, direction, levels, econ, hedge,
         price_data, options_data, ratings,
         mode=mode, existing_position=existing_position,
+        scoreboard=scoreboard,
     )
 
     try:
         response = anthropic_client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=2400,
+            max_tokens=2800,    # bumped slightly for the scoreboard reasons
             messages=[{"role": "user", "content": prompt}],
         )
         ai_text = "".join(
@@ -2780,19 +2826,32 @@ def get_trade_plan():
         logger.exception("Anthropic API call failed: %s", e)
         return jsonify({"error": f"AI commentary failed: {str(e)}"}), 500
 
+    # --- Parse AI scoreboard reasons from the commentary ---
+    # AI returns a section like:
+    #   ## SCOREBOARD_REASONS
+    #   RSI(14): one-line reason
+    #   PCR (OI): another one-line reason
+    #   ...
+    # We extract these and merge back into the scoreboard rows.
+    # The reasons section is stripped from the visible commentary so the user
+    # sees only the prose memo.
+    scoreboard, ai_text = _parse_scoreboard_reasons(scoreboard, ai_text)
+
     return jsonify({
-        "symbol":             symbol,
-        "analyzed_at":        datetime.utcnow().isoformat() + "Z",
-        "direction":          direction,
-        "input_mode":         input_mode,
-        "mode":               mode,
-        "lot_size":           lot_size,
-        "levels":             levels,
-        "economics":          econ,
-        "hedge":              hedge,
-        "existing_position":  existing_position,
-        "ai_commentary":      ai_text,
-        "model":              ANTHROPIC_MODEL,
+        "symbol":              symbol,
+        "analyzed_at":         datetime.utcnow().isoformat() + "Z",
+        "direction":           direction,
+        "input_mode":          input_mode,
+        "mode":                mode,
+        "lot_size":            lot_size,
+        "levels":              levels,
+        "economics":           econ,
+        "hedge":               hedge,
+        "existing_position":   existing_position,
+        "scoreboard":          scoreboard,
+        "scoreboard_summary":  scoreboard_summary,
+        "ai_commentary":       ai_text,
+        "model":               ANTHROPIC_MODEL,
     }), 200
 
 
@@ -2811,6 +2870,562 @@ def get_trade_plan():
 # ===========================================================================
 
 from peer_map import get_peers as _get_hardcoded_peers
+
+
+# ===========================================================================
+# SCOREBOARD — factor-by-factor verdict table for trade plan
+# ===========================================================================
+#
+# Algorithmic verdict picker: for each factor (RSI, PCR, PE, etc.) we compute
+# whether it's FAVORABLE, NEUTRAL, or AGAINST the user's direction (long/short).
+#
+# Each row gets a placeholder for an AI-written one-line reason that the
+# AI prompt fills in. Backend computes the verdicts deterministically;
+# AI does the prose.
+#
+# Returns a list of factor dicts:
+#   {
+#     "bucket":   "Trend & Momentum",
+#     "factor":   "Price vs SMA50",
+#     "value":    "+3.2%",
+#     "verdict":  "favorable" | "neutral" | "against",
+#     "reason":   ""   # to be filled by AI
+#   }
+# ===========================================================================
+
+# Try to import fundamentals_fetcher — optional dependency. If the user
+# hasn't added the module to this repo yet (it lives in the cron repo
+# originally), the scoreboard will skip the fundamentals bucket gracefully.
+try:
+    from fundamentals_fetcher import get_fundamentals
+    FUNDAMENTALS_AVAILABLE = True
+except ImportError:
+    logger.warning(
+        "fundamentals_fetcher not available — scoreboard will skip "
+        "fundamentals bucket. Copy fundamentals_fetcher.py from the "
+        "cron repo to enable PE/ROE/growth/promoter signals."
+    )
+    FUNDAMENTALS_AVAILABLE = False
+    def get_fundamentals(symbol):
+        return None
+
+
+def _verdict_for_long_short(value_is_bullish: Optional[bool], direction: str) -> str:
+    """
+    Convert a bullish/bearish signal to a verdict relative to user's direction.
+
+    Args:
+      value_is_bullish: True (bullish), False (bearish), None (neutral)
+      direction: "long" | "short" | "hedged"
+
+    Returns: "favorable" | "against" | "neutral"
+    """
+    if value_is_bullish is None:
+        return "neutral"
+    is_long_aligned = direction in ("long", "hedged")
+    # If signal is bullish and user is long → favorable
+    # If signal is bullish and user is short → against
+    if value_is_bullish == is_long_aligned:
+        return "favorable"
+    return "against"
+
+
+def _build_scoreboard(
+    direction: str,
+    price_data: dict,
+    options_data: Optional["OptionChainData"],
+    ratings: Optional[dict],
+    fundamentals,  # Fundamentals dataclass or None
+) -> list[dict]:
+    """
+    Build the factor-by-factor scoreboard.
+
+    Each factor has a hardcoded rule for bullish/bearish/neutral based on
+    common technical analysis conventions. Verdict is then mapped to
+    FAVORABLE/AGAINST/NEUTRAL based on user's direction.
+
+    Reasons are left empty — AI fills them later.
+    """
+    rows: list[dict] = []
+    p = price_data
+    price = p["current_price"]
+
+    # ===== Bucket 1: Trend & Momentum =====
+    sma_50 = p.get("sma_50") or 0
+    sma_200 = p.get("sma_200") or 0
+
+    # Price vs SMA50
+    if sma_50 > 0:
+        pct_from_sma50 = (price - sma_50) / sma_50 * 100
+        is_bullish = pct_from_sma50 > 1.5 if pct_from_sma50 > 0 else (pct_from_sma50 > -1.5 if pct_from_sma50 < 0 else None)
+        # Refined: clearly above (>1.5%) = bullish; clearly below (<-1.5%) = bearish; near = neutral
+        if pct_from_sma50 > 1.5:
+            is_bullish = True
+        elif pct_from_sma50 < -1.5:
+            is_bullish = False
+        else:
+            is_bullish = None
+        rows.append({
+            "bucket":  "Trend & Momentum",
+            "factor":  "Price vs SMA 50",
+            "value":   f"{pct_from_sma50:+.2f}%",
+            "verdict": _verdict_for_long_short(is_bullish, direction),
+        })
+
+    # Price vs SMA200
+    if sma_200 > 0:
+        pct_from_sma200 = (price - sma_200) / sma_200 * 100
+        if pct_from_sma200 > 2:
+            is_bullish = True
+        elif pct_from_sma200 < -2:
+            is_bullish = False
+        else:
+            is_bullish = None
+        rows.append({
+            "bucket":  "Trend & Momentum",
+            "factor":  "Price vs SMA 200",
+            "value":   f"{pct_from_sma200:+.2f}%",
+            "verdict": _verdict_for_long_short(is_bullish, direction),
+        })
+
+    # RSI(14)
+    rsi_val = p.get("rsi_14") or 50
+    if rsi_val >= 70:
+        # Overbought — bearish for new longs, favorable for shorts
+        is_bullish = False
+    elif rsi_val <= 30:
+        # Oversold — bullish for longs, bearish for shorts
+        is_bullish = True
+    elif 40 <= rsi_val <= 60:
+        is_bullish = None
+    elif rsi_val > 60:
+        # Strong but not OB — bullish
+        is_bullish = True
+    else:
+        # 30-40 — weak
+        is_bullish = False
+    rows.append({
+        "bucket":  "Trend & Momentum",
+        "factor":  "RSI(14)",
+        "value":   f"{rsi_val:.1f}",
+        "verdict": _verdict_for_long_short(is_bullish, direction),
+    })
+
+    # MACD signal
+    macd_line = p.get("macd_line")
+    macd_signal = p.get("macd_signal")
+    if macd_line is not None and macd_signal is not None:
+        macd_diff = macd_line - macd_signal
+        if abs(macd_diff) < 0.05:
+            is_bullish = None
+        else:
+            is_bullish = macd_diff > 0
+        rows.append({
+            "bucket":  "Trend & Momentum",
+            "factor":  "MACD",
+            "value":   f"{macd_diff:+.2f} ({'bullish cross' if macd_diff > 0 else 'bearish cross'})",
+            "verdict": _verdict_for_long_short(is_bullish, direction),
+        })
+
+    # 30-day price change
+    chg_30d = p.get("pct_change_30d") or 0
+    if chg_30d > 5:
+        is_bullish = True
+    elif chg_30d < -5:
+        is_bullish = False
+    else:
+        is_bullish = None
+    rows.append({
+        "bucket":  "Trend & Momentum",
+        "factor":  "30-day move",
+        "value":   f"{chg_30d:+.2f}%",
+        "verdict": _verdict_for_long_short(is_bullish, direction),
+    })
+
+    # ===== Bucket 2: Technical Structure =====
+    # Distance from 52w high/low
+    high_52w = p.get("high_52w") or price
+    low_52w = p.get("low_52w") or price
+    pct_from_high = (price - high_52w) / high_52w * 100   # always <= 0
+    pct_from_low  = (price - low_52w) / low_52w * 100     # always >= 0
+
+    # For longs: near 52w high = bullish breakout potential BUT also resistance
+    # We treat <5% from high as bullish (momentum), >20% from high as bearish (broken trend)
+    if pct_from_high > -5:
+        is_bullish = True   # near highs = strong
+    elif pct_from_high < -25:
+        is_bullish = False  # far from highs = weak trend
+    else:
+        is_bullish = None
+    rows.append({
+        "bucket":  "Technical Structure",
+        "factor":  "Distance from 52w high",
+        "value":   f"{pct_from_high:+.1f}%",
+        "verdict": _verdict_for_long_short(is_bullish, direction),
+    })
+
+    # For longs: near 52w low = bearish; far from low = bullish (uptrend confirmed)
+    if pct_from_low > 30:
+        is_bullish = True    # well off lows = strong uptrend
+    elif pct_from_low < 8:
+        is_bullish = False   # near lows = weak
+    else:
+        is_bullish = None
+    rows.append({
+        "bucket":  "Technical Structure",
+        "factor":  "Distance from 52w low",
+        "value":   f"+{pct_from_low:.1f}%",
+        "verdict": _verdict_for_long_short(is_bullish, direction),
+    })
+
+    # Bollinger Band position
+    bb_upper = p.get("bb_upper")
+    bb_lower = p.get("bb_lower")
+    if bb_upper and bb_lower and bb_upper > bb_lower:
+        bb_pct = (price - bb_lower) / (bb_upper - bb_lower) * 100
+        if bb_pct > 80:
+            # Near upper band — overextended for longs, oversold-pop opportunity for shorts (mean reversion)
+            is_bullish = False
+            bb_label = "near upper band"
+        elif bb_pct < 20:
+            is_bullish = True
+            bb_label = "near lower band"
+        else:
+            is_bullish = None
+            bb_label = "mid-band"
+        rows.append({
+            "bucket":  "Technical Structure",
+            "factor":  "Bollinger position",
+            "value":   f"{bb_pct:.0f}% ({bb_label})",
+            "verdict": _verdict_for_long_short(is_bullish, direction),
+        })
+
+    # Volume vs 20-day average
+    vol_ratio = p.get("volume_ratio") or 1.0
+    if vol_ratio > 1.5:
+        # High volume — confirmation; direction depends on price action
+        # We treat high volume on an UP move as bullish, on a DOWN move as bearish
+        is_bullish = chg_30d > 0  # rough proxy
+    elif vol_ratio < 0.7:
+        is_bullish = None   # weak volume = no conviction either way
+    else:
+        is_bullish = None
+    rows.append({
+        "bucket":  "Technical Structure",
+        "factor":  "Volume vs 20d avg",
+        "value":   f"{vol_ratio:.2f}x",
+        "verdict": _verdict_for_long_short(is_bullish, direction),
+    })
+
+    # ===== Bucket 3: Options Sentiment =====
+    if options_data is not None:
+        # Composite signal — the main bullish/bearish read
+        comp = (options_data.composite_signal or "").lower()
+        if "strong bullish" in comp:
+            is_bullish = True
+        elif "bullish" in comp:
+            is_bullish = True
+        elif "strong bearish" in comp:
+            is_bullish = False
+        elif "bearish" in comp:
+            is_bullish = False
+        else:
+            is_bullish = None
+        rows.append({
+            "bucket":  "Options Sentiment",
+            "factor":  "Composite signal",
+            "value":   f"{options_data.composite_signal} ({options_data.composite_strength}/5)",
+            "verdict": _verdict_for_long_short(is_bullish, direction),
+        })
+
+        # PCR (calibrated for Indian stocks: >0.95 bullish, <0.55 bearish)
+        pcr = options_data.pcr_oi
+        if pcr >= 0.95:
+            is_bullish = True
+        elif pcr < 0.55:
+            is_bullish = False
+        else:
+            is_bullish = None
+        rows.append({
+            "bucket":  "Options Sentiment",
+            "factor":  "PCR (OI)",
+            "value":   f"{pcr:.2f}",
+            "verdict": _verdict_for_long_short(is_bullish, direction),
+        })
+
+        # Max Pain distance — only signals when stretched (>4%)
+        if options_data.max_pain > 0:
+            pct_from_pain = (price - options_data.max_pain) / options_data.max_pain * 100
+            if pct_from_pain > 4:
+                # Price above max pain — gravitational pull DOWN to expiry = bearish for new longs
+                is_bullish = False
+            elif pct_from_pain < -4:
+                is_bullish = True
+            else:
+                is_bullish = None
+            rows.append({
+                "bucket":  "Options Sentiment",
+                "factor":  "Max Pain distance",
+                "value":   f"{pct_from_pain:+.1f}% ({'above' if pct_from_pain > 0 else 'below'} max pain ₹{options_data.max_pain:.0f})",
+                "verdict": _verdict_for_long_short(is_bullish, direction),
+            })
+
+        # OI Buildup signal
+        bld = (options_data.buildup_signal or "").lower()
+        if bld == "long buildup":
+            is_bullish = True
+        elif bld == "short covering":
+            is_bullish = True
+        elif bld == "short buildup":
+            is_bullish = False
+        elif bld == "long unwinding":
+            is_bullish = False
+        else:
+            is_bullish = None
+        rows.append({
+            "bucket":  "Options Sentiment",
+            "factor":  "OI buildup",
+            "value":   options_data.buildup_signal,
+            "verdict": _verdict_for_long_short(is_bullish, direction),
+        })
+
+    # ===== Bucket 4: Analyst Sentiment =====
+    if ratings and ratings.get("data_source") != "unavailable":
+        # Consensus
+        consensus = (ratings.get("consensus") or "").lower()
+        if "strong buy" in consensus:
+            is_bullish = True
+        elif consensus == "buy":
+            is_bullish = True
+        elif "strong sell" in consensus:
+            is_bullish = False
+        elif consensus == "sell":
+            is_bullish = False
+        elif consensus == "hold" or consensus == "underperform" or consensus == "outperform":
+            # Hold is neutral; under/outperform are weak signals
+            if consensus == "outperform":
+                is_bullish = True
+            elif consensus == "underperform":
+                is_bullish = False
+            else:
+                is_bullish = None
+        else:
+            is_bullish = None
+        rows.append({
+            "bucket":  "Analyst Sentiment",
+            "factor":  "Consensus",
+            "value":   ratings.get("consensus") or "—",
+            "verdict": _verdict_for_long_short(is_bullish, direction),
+        })
+
+        # Mean target upside
+        if ratings.get("price_target"):
+            target = ratings["price_target"].get("mean")
+            if target:
+                upside_pct = (target - price) / price * 100
+                if upside_pct > 8:
+                    is_bullish = True
+                elif upside_pct < -3:
+                    is_bullish = False
+                else:
+                    is_bullish = None
+                rows.append({
+                    "bucket":  "Analyst Sentiment",
+                    "factor":  "Mean target upside",
+                    "value":   f"₹{target:.0f} ({upside_pct:+.1f}%)",
+                    "verdict": _verdict_for_long_short(is_bullish, direction),
+                })
+
+        # Recent broker actions trend (last 8)
+        actions = ratings.get("recent_actions") or []
+        if actions:
+            upgrades = sum(1 for a in actions if "up" in (a.get("action", "") or "").lower()
+                           or "raised" in (a.get("action", "") or "").lower())
+            downgrades = sum(1 for a in actions if "down" in (a.get("action", "") or "").lower()
+                             or "cut" in (a.get("action", "") or "").lower())
+            if upgrades > downgrades:
+                is_bullish = True
+            elif downgrades > upgrades:
+                is_bullish = False
+            else:
+                is_bullish = None
+            rows.append({
+                "bucket":  "Analyst Sentiment",
+                "factor":  "Recent broker actions",
+                "value":   f"{upgrades} ↑ / {downgrades} ↓ (last {len(actions)})",
+                "verdict": _verdict_for_long_short(is_bullish, direction),
+            })
+
+    # ===== Bucket 5: Fundamentals =====
+    if fundamentals is not None:
+        # PE ratio — for Indian stocks, broad benchmarks:
+        # <15 = cheap (bullish for longs); 15-30 = fair; >50 = expensive (caution)
+        if fundamentals.pe_ratio:
+            pe = fundamentals.pe_ratio
+            if pe < 0:
+                # Negative PE = loss-making
+                is_bullish = False
+                pe_label = f"{pe:.1f} (loss-making)"
+            elif pe < 18:
+                is_bullish = True
+                pe_label = f"{pe:.1f} (cheap)"
+            elif pe > 50:
+                is_bullish = False
+                pe_label = f"{pe:.1f} (expensive)"
+            else:
+                is_bullish = None
+                pe_label = f"{pe:.1f}"
+            rows.append({
+                "bucket":  "Fundamentals",
+                "factor":  "PE ratio",
+                "value":   pe_label,
+                "verdict": _verdict_for_long_short(is_bullish, direction),
+            })
+
+        # ROE — for Indian stocks: >15% = good, <10% = poor
+        if fundamentals.roe_pct:
+            roe = fundamentals.roe_pct
+            if roe > 18:
+                is_bullish = True
+            elif roe < 10:
+                is_bullish = False
+            else:
+                is_bullish = None
+            rows.append({
+                "bucket":  "Fundamentals",
+                "factor":  "ROE",
+                "value":   f"{roe:.1f}%",
+                "verdict": _verdict_for_long_short(is_bullish, direction),
+            })
+
+        # 3-year profit growth CAGR
+        if fundamentals.profit_growth_3y_pct is not None:
+            growth = fundamentals.profit_growth_3y_pct
+            if growth > 15:
+                is_bullish = True
+            elif growth < 0:
+                is_bullish = False
+            else:
+                is_bullish = None
+            rows.append({
+                "bucket":  "Fundamentals",
+                "factor":  "3Y profit growth (CAGR)",
+                "value":   f"{growth:+.1f}%",
+                "verdict": _verdict_for_long_short(is_bullish, direction),
+            })
+
+        # Promoter holding — 35-75% = sweet spot
+        if fundamentals.promoter_holding_pct:
+            ph = fundamentals.promoter_holding_pct
+            if 35 <= ph <= 75:
+                is_bullish = True
+            elif ph < 20:
+                is_bullish = False
+            else:
+                is_bullish = None
+            rows.append({
+                "bucket":  "Fundamentals",
+                "factor":  "Promoter holding",
+                "value":   f"{ph:.1f}%",
+                "verdict": _verdict_for_long_short(is_bullish, direction),
+            })
+
+    # Add empty reason placeholder for AI to fill
+    for row in rows:
+        row["reason"] = ""
+
+    return rows
+
+
+def _summarize_scoreboard(rows: list[dict]) -> dict:
+    """Compute net counts for the summary line at the bottom."""
+    favorable = sum(1 for r in rows if r["verdict"] == "favorable")
+    neutral   = sum(1 for r in rows if r["verdict"] == "neutral")
+    against   = sum(1 for r in rows if r["verdict"] == "against")
+    net = favorable - against
+    return {
+        "favorable":  favorable,
+        "neutral":    neutral,
+        "against":    against,
+        "total":      len(rows),
+        "net_score":  net,
+        # Verdict label based on net
+        "verdict_label": (
+            "Strongly Aligned" if net >= 6 else
+            "Aligned"          if net >= 3 else
+            "Mixed Signals"    if net >= -2 else
+            "Misaligned"       if net >= -5 else
+            "Strongly Misaligned"
+        ),
+    }
+
+
+def _parse_scoreboard_reasons(scoreboard: list[dict], ai_text: str) -> tuple[list[dict], str]:
+    """
+    Extract the SCOREBOARD_REASONS section from the AI's response and merge
+    the one-line reasons back into the scoreboard rows.
+
+    Expected format from AI:
+      ## SCOREBOARD_REASONS
+      RSI(14): RSI 65 leaves room before overbought
+      PCR (OI): 0.85 is neutral for Indian stocks
+      ...
+
+    Returns:
+      (scoreboard with .reason fields populated, ai_text with section stripped)
+    """
+    import re
+
+    # Find the section. Tolerant of various heading levels and capitalization.
+    section_pattern = r"#{1,4}\s*SCOREBOARD[_\s]REASONS[\s\S]*?(?=\n#{1,4}\s|\Z)"
+    match = re.search(section_pattern, ai_text, flags=re.IGNORECASE)
+
+    if not match:
+        # AI didn't include the section — fall back to leaving reasons blank
+        logger.warning("AI response missing SCOREBOARD_REASONS section; reasons will be empty")
+        return scoreboard, ai_text
+
+    section_text = match.group(0)
+
+    # Strip the heading line itself and parse the rest as "factor: reason"
+    lines = section_text.split("\n")[1:]   # skip heading
+    reason_map = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Strip leading markers like "- " or "* " from bullet lists
+        line = re.sub(r"^[-*•]\s*", "", line)
+        # Strip leading bold markers
+        line = re.sub(r"^\*\*([^*]+)\*\*\s*[:\-]?\s*", r"\1: ", line)
+        # Match "Factor name: reason text"
+        m = re.match(r"^([^:]+?)\s*[:\-—]\s*(.+)$", line)
+        if not m:
+            continue
+        factor_name = m.group(1).strip()
+        reason = m.group(2).strip()
+        # Use lower-cased factor name as key for fuzzy matching
+        reason_map[factor_name.lower()] = reason
+
+    # Merge reasons into scoreboard rows (match by factor name, case-insensitive)
+    for row in scoreboard:
+        factor_lower = row["factor"].lower()
+        # Try exact match first, then partial
+        if factor_lower in reason_map:
+            row["reason"] = reason_map[factor_lower]
+        else:
+            # Find any key that's a substring match (handles minor naming drift)
+            for key, val in reason_map.items():
+                if key in factor_lower or factor_lower in key:
+                    row["reason"] = val
+                    break
+
+    # Strip the section from ai_text so the user doesn't see the raw key:value list
+    cleaned_text = re.sub(section_pattern, "", ai_text, flags=re.IGNORECASE).strip()
+    return scoreboard, cleaned_text
+
+
+
 
 
 def _resolve_peers(symbol: str, max_peers: int = 3) -> tuple[list[str], str]:
