@@ -3237,5 +3237,228 @@ def get_peer_comparison():
     }), 200
 
 
+# ===========================================================================
+# TRADING JOURNAL — Postgres-backed CRUD for trade entries
+# ===========================================================================
+#
+# Endpoints:
+#   GET    /api/journal              — list all trades (optional ?status=open|closed)
+#   GET    /api/journal/<id>         — fetch a single trade
+#   POST   /api/journal              — create a new trade
+#   PATCH  /api/journal/<id>         — partial update of an existing trade
+#   POST   /api/journal/<id>/close   — close an open trade (sets exit price/date)
+#   DELETE /api/journal/<id>         — permanently delete a trade
+#
+# All endpoints return JSON. Open trades get enriched with live spot price
+# + unrealized P&L on list/get. Closed trades get realized P&L + R-multiple.
+# ===========================================================================
+
+import journal_store
+
+
+def _current_spot_for_open(symbol: str) -> Optional[float]:
+    """Try to fetch current spot price for an open position; return None on failure."""
+    try:
+        price_data = _fetch_price_data(symbol)
+        if price_data:
+            return float(price_data["current_price"])
+    except Exception as e:
+        logger.debug("Spot fetch failed for journal enrichment %s: %s", symbol, e)
+    return None
+
+
+@app.route("/api/journal", methods=["GET"])
+def journal_list():
+    """
+    List trades. Query params:
+      ?status=open    → only open
+      ?status=closed  → only closed
+      (no param)      → all
+      ?limit=N        → cap results (default 100)
+    """
+    try:
+        status = request.args.get("status")
+        if status and status not in journal_store.VALID_STATUSES:
+            return jsonify({"error": f"status must be one of {journal_store.VALID_STATUSES}"}), 400
+        try:
+            limit = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit must be an integer"}), 400
+        limit = max(1, min(limit, 500))   # bounded
+
+        # Run retention purge opportunistically (cheap — bounded by index)
+        try:
+            journal_store.purge_old_trades()
+        except Exception as e:
+            # Non-fatal — journal still works even if purge fails
+            logger.warning("Journal purge failed: %s", e)
+
+        raw = journal_store.list_trades(status=status, limit=limit)
+
+        # Enrich each trade with derived metrics.
+        # Open trades get a current-price lookup (best-effort, fail-soft).
+        # We fetch each symbol's price only once even if multiple open
+        # positions in same symbol.
+        spot_cache: dict[str, Optional[float]] = {}
+        enriched = []
+        for trade in raw:
+            current_price = None
+            if trade["status"] == "open":
+                sym = trade["symbol"]
+                if sym not in spot_cache:
+                    spot_cache[sym] = _current_spot_for_open(sym)
+                current_price = spot_cache[sym]
+            enriched.append(journal_store.enrich_with_metrics(trade, current_price))
+
+        # Compute aggregate stats across closed trades for the dashboard widget
+        closed_only = [t for t in enriched if t["status"] == "closed"]
+        stats = journal_store.compute_aggregate_stats(closed_only)
+
+        # Compute total unrealized P&L across open positions (rough portfolio gauge)
+        open_only = [t for t in enriched if t["status"] == "open"]
+        total_unrealized = sum(
+            t.get("unrealized_pnl", 0) or 0 for t in open_only
+        )
+
+        return jsonify({
+            "trades":             enriched,
+            "stats":              stats,
+            "total_unrealized":   round(total_unrealized, 2),
+            "open_count":         len(open_only),
+            "closed_count":       len(closed_only),
+            "retention_days":     journal_store.RETENTION_DAYS,
+            "fetched_at":         datetime.utcnow().isoformat() + "Z",
+        }), 200
+    except Exception as e:
+        logger.exception("journal_list failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/journal/<int:trade_id>", methods=["GET"])
+def journal_get(trade_id: int):
+    """Fetch a single trade with enrichment."""
+    try:
+        trade = journal_store.get_trade(trade_id)
+        if not trade:
+            return jsonify({"error": "trade not found"}), 404
+
+        current_price = None
+        if trade["status"] == "open":
+            current_price = _current_spot_for_open(trade["symbol"])
+        enriched = journal_store.enrich_with_metrics(trade, current_price)
+        return jsonify(enriched), 200
+    except Exception as e:
+        logger.exception("journal_get(%s) failed: %s", trade_id, e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/journal", methods=["POST"])
+def journal_create():
+    """
+    Create a new trade entry.
+
+    Body (all but symbol/direction/qty/entry_price are optional):
+      {
+        "symbol":          "RELIANCE",
+        "direction":       "long" | "short" | "hedged",
+        "qty":             100,
+        "entry_price":     2450.50,
+        "entry_date":      "2026-05-15"   (default: today),
+        "stop_loss":       2380.00,
+        "target_price":    2600.00,
+        "setup_type":      "breakout" | "reversal" | ...,
+        "why_taken":       "free text..."
+      }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        created = journal_store.create_trade(body)
+        return jsonify(created), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("journal_create failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/journal/<int:trade_id>", methods=["PATCH"])
+def journal_update(trade_id: int):
+    """Partial update of an existing trade. Body contains only fields to change."""
+    try:
+        body = request.get_json(silent=True) or {}
+        updated = journal_store.update_trade(trade_id, body)
+        if not updated:
+            return jsonify({"error": "trade not found"}), 404
+        return jsonify(updated), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("journal_update(%s) failed: %s", trade_id, e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/journal/<int:trade_id>/close", methods=["POST"])
+def journal_close(trade_id: int):
+    """
+    Close an open trade.
+
+    Body:
+      {
+        "exit_price":      2580.00,         (required)
+        "exit_date":       "2026-05-22",    (default: today)
+        "went_well":       "free text...",
+        "went_wrong":      "free text...",
+        "emotional_state": "disciplined" | ...,
+        "lesson_learned":  "free text..."
+      }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+
+        try:
+            exit_price = float(body.get("exit_price", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "exit_price must be a number"}), 400
+        if exit_price <= 0:
+            return jsonify({"error": "exit_price must be > 0"}), 400
+
+        existing = journal_store.get_trade(trade_id)
+        if not existing:
+            return jsonify({"error": "trade not found"}), 404
+        if existing["status"] == "closed":
+            return jsonify({"error": "trade is already closed"}), 400
+
+        closed = journal_store.close_trade(
+            trade_id,
+            exit_price      = exit_price,
+            exit_date_str   = body.get("exit_date"),
+            went_well       = body.get("went_well"),
+            went_wrong      = body.get("went_wrong"),
+            emotional_state = body.get("emotional_state"),
+            lesson_learned  = body.get("lesson_learned"),
+        )
+        if not closed:
+            return jsonify({"error": "close failed"}), 500
+        return jsonify(closed), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("journal_close(%s) failed: %s", trade_id, e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/journal/<int:trade_id>", methods=["DELETE"])
+def journal_delete(trade_id: int):
+    """Permanently delete a trade."""
+    try:
+        deleted = journal_store.delete_trade(trade_id)
+        if not deleted:
+            return jsonify({"error": "trade not found"}), 404
+        return jsonify({"deleted": True, "id": trade_id}), 200
+    except Exception as e:
+        logger.exception("journal_delete(%s) failed: %s", trade_id, e)
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
