@@ -9,8 +9,9 @@ Endpoints:
   POST /api/analyze   → full AI analysis (technicals + analyst + news + options)
   POST /api/options   → standalone options-only analysis
   POST /api/compare   → side-by-side comparison of 2 stocks with AI verdict
-  POST /api/strategy  → AI-recommended options strategy with concrete legs + P/L
-  POST /api/position  → AI guidance on an existing position (hold/exit/scale)
+  POST /api/strategy          → AI-recommended options strategy with concrete legs + P/L
+  POST /api/position          → AI guidance on an existing position (hold/exit/scale)
+  POST /api/trade-plan/pine-script → Pine Script v5 for TradingView with all trade levels
 """
 
 from __future__ import annotations
@@ -2852,6 +2853,189 @@ def get_trade_plan():
         "scoreboard_summary":  scoreboard_summary,
         "ai_commentary":       ai_text,
         "model":               ANTHROPIC_MODEL,
+    }), 200
+
+
+# ===========================================================================
+# PINE SCRIPT GENERATOR — export trade plan levels as TradingView Pine Script
+# ===========================================================================
+#
+# Endpoint: POST /api/trade-plan/pine-script
+# Body: same as /api/trade-plan (symbol, direction, input_mode, qty/capital,
+#       plus optional existing-position fields)
+#
+# Returns:
+#   { "symbol": str, "pine_script": str }
+#
+# The pine_script value is a ready-to-paste Pine Script v5 indicator that
+# draws all key price levels (support, resistance, SMAs, BB, 52w extremes,
+# entry zone, stop loss, targets) as labelled horizontal lines + a shaded
+# entry zone box, with the actual numeric levels hardcoded into the script.
+# ===========================================================================
+
+def _generate_pine_script(symbol: str, direction: str, levels: dict) -> str:
+    """Return a Pine Script v5 indicator string with all trade-plan levels baked in."""
+    ref   = levels.get("reference_levels", {})
+    ez    = levels.get("entry_zone", {})
+    sl    = levels.get("stop_loss", {})
+    tgts  = levels.get("targets", {})
+
+    # Pull every numeric level (0.0 means "not available" — script skips zeros)
+    r_res   = ref.get("nearest_resistance") or 0.0
+    r_sup   = ref.get("nearest_support")    or 0.0
+    r_s20   = ref.get("sma_20")  or 0.0
+    r_s50   = ref.get("sma_50")  or 0.0
+    r_s200  = ref.get("sma_200") or 0.0
+    r_bbu   = ref.get("bb_upper") or 0.0
+    r_bbl   = ref.get("bb_lower") or 0.0
+    r_h52   = ref.get("high_52w") or 0.0
+    r_l52   = ref.get("low_52w")  or 0.0
+    r_atgt  = ref.get("analyst_target") or 0.0
+
+    ez_lo   = ez.get("low")  or 0.0
+    ez_hi   = ez.get("high") or 0.0
+    ez_mid  = ez.get("mid")  or 0.0
+
+    sl_px   = sl.get("price") or 0.0
+    sl_src  = (sl.get("source") or "").replace('"', "'")
+
+    t1_px   = tgts.get("t1", {}).get("price") or 0.0
+    t2_px   = tgts.get("t2", {}).get("price") or 0.0
+    t3_px   = tgts.get("t3", {}).get("price") or 0.0
+
+    dir_label = direction.upper()
+    analyzed  = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    script = f'''\
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// NSE Trading Plan — {symbol}  ({dir_label})
+// Generated: {analyzed}
+// Paste into TradingView Pine Script Editor → Add to chart
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("NSE Plan · {symbol} · {dir_label}", overlay=true,
+         max_lines_count=20, max_labels_count=20, max_boxes_count=2)
+
+// ── Levels (hardcoded from your trading plan) ────────────────────────────────
+var float RESISTANCE   = {r_res}    // Nearest resistance — highest Call OI strike
+var float SUPPORT      = {r_sup}    // Nearest support    — highest Put OI strike
+var float SMA_20       = {r_s20}
+var float SMA_50       = {r_s50}
+var float SMA_200      = {r_s200}
+var float BB_UPPER     = {r_bbu}
+var float BB_LOWER     = {r_bbl}
+var float HIGH_52W     = {r_h52}
+var float LOW_52W      = {r_l52}
+var float ANALYST_TGT  = {r_atgt}
+
+var float ENTRY_LOW    = {ez_lo}
+var float ENTRY_MID    = {ez_mid}
+var float ENTRY_HIGH   = {ez_hi}
+var float STOP_LOSS    = {sl_px}    // {sl_src}
+var float T1           = {t1_px}    // Take 33% — 1.5R
+var float T2           = {t2_px}    // Take 33%
+var float T3           = {t3_px}    // Final exit
+
+// ── Helper — draw horizontal line + right-side label (runs once on last bar) ─
+f_hline(price, col, lbl, sty) =>
+    if price != 0.0
+        line.new(bar_index - 100, price, bar_index, price,
+                 extend=extend.right, color=col, style=sty, width=2)
+        label.new(bar_index + 2, price, lbl + "  " + str.tostring(price, "#.##"),
+                  xloc=xloc.bar_index, yloc=yloc.price,
+                  style=label.style_label_right,
+                  color=color.new(col, 85), textcolor=col, size=size.small)
+
+// ── Draw everything on the last (right-most) bar only ───────────────────────
+if barstate.islast
+
+    // Support & Resistance (Options OI)
+    f_hline(RESISTANCE,  color.red,          "Resistance (Call OI)", line.style_solid)
+    f_hline(SUPPORT,     color.green,        "Support (Put OI)",     line.style_solid)
+
+    // Moving Averages
+    f_hline(SMA_20,      color.orange,       "SMA 20",               line.style_dashed)
+    f_hline(SMA_50,      color.yellow,       "SMA 50",               line.style_dashed)
+    f_hline(SMA_200,     color.white,        "SMA 200",              line.style_dashed)
+
+    // Bollinger Bands
+    f_hline(BB_UPPER,    color.purple,       "BB Upper",             line.style_dotted)
+    f_hline(BB_LOWER,    color.purple,       "BB Lower",             line.style_dotted)
+
+    // 52-Week extremes
+    f_hline(HIGH_52W,    color.fuchsia,      "52W High",             line.style_dotted)
+    f_hline(LOW_52W,     color.fuchsia,      "52W Low",              line.style_dotted)
+
+    // Analyst target
+    f_hline(ANALYST_TGT, color.aqua,        "Analyst Target",       line.style_dotted)
+
+    // Entry zone — shaded box
+    if ENTRY_LOW != 0.0 and ENTRY_HIGH != 0.0
+        box.new(bar_index - 100, ENTRY_HIGH, bar_index, ENTRY_LOW,
+                border_color=color.new(color.blue, 20),
+                bgcolor=color.new(color.blue, 82),
+                extend=extend.right,
+                text="ENTRY ZONE  ₹" + str.tostring(ENTRY_LOW, "#.##") +
+                     " – ₹" + str.tostring(ENTRY_HIGH, "#.##"),
+                text_color=color.new(color.blue, 10),
+                text_size=size.small)
+    f_hline(ENTRY_MID,   color.blue,        "Entry Mid",            line.style_dashed)
+
+    // Stop loss
+    f_hline(STOP_LOSS,   color.red,         "STOP LOSS",            line.style_solid)
+
+    // Targets
+    f_hline(T1,          color.lime,        "T1 (33%)",             line.style_dashed)
+    f_hline(T2,          color.lime,        "T2 (33%)",             line.style_dashed)
+    f_hline(T3,          color.lime,        "T3 Final",             line.style_dashed)
+'''
+    return script.strip()
+
+
+@app.route("/api/trade-plan/pine-script", methods=["POST"])
+def get_trade_plan_pine_script():
+    """
+    Generate a ready-to-paste TradingView Pine Script for all trade plan levels.
+
+    Body: same as POST /api/trade-plan but qty/capital can be omitted
+    (they don't affect price levels — pass qty=1 or capital=1 if not needed).
+
+    Returns:
+      { "symbol": str, "direction": str, "pine_script": str }
+    """
+    body = request.get_json(silent=True) or {}
+
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol required"}), 400
+    if not all(c.isalnum() or c in "&-" for c in symbol):
+        return jsonify({"error": "invalid symbol"}), 400
+
+    direction = (body.get("direction") or "long").strip().lower()
+    if direction not in ("long", "short", "hedged"):
+        return jsonify({"error": "direction must be 'long', 'short', or 'hedged'"}), 400
+
+    logger.info("Pine Script request for %s (%s)", symbol, direction)
+
+    price_data = _fetch_price_data(symbol)
+    if price_data is None:
+        return jsonify({"error": f"Could not fetch price data for {symbol}"}), 404
+
+    current_price = price_data["current_price"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_ratings = executor.submit(_fetch_analyst_ratings, symbol)
+        future_options = executor.submit(fetch_options_data, symbol, current_price)
+        ratings      = future_ratings.result()
+        options_data = future_options.result()
+
+    levels = _compute_trade_levels(direction, price_data, options_data, ratings)
+    pine   = _generate_pine_script(symbol, direction, levels)
+
+    return jsonify({
+        "symbol":     symbol,
+        "direction":  direction,
+        "pine_script": pine,
     }), 200
 
 
