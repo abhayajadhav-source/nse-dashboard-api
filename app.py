@@ -15,14 +15,8 @@ Endpoints:
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
 import logging
 import os
-import secrets
-import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -49,229 +43,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-# ---------------------------------------------------------------------------
-# CORS — lock to your own frontend origin(s) instead of "*".
-# Set ALLOWED_ORIGINS env var to a comma-separated list, e.g.
-#   https://nse-dashboard.abhay-a-jadhav.workers.dev
-# Falls back to "*" only if the var is unset (so nothing breaks before you
-# configure it — but you SHOULD set it once deployed).
-# ---------------------------------------------------------------------------
-_origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
-if _origins_env:
-    _allowed_origins = [o.strip() for o in _origins_env.split(",") if o.strip()]
-else:
-    _allowed_origins = ["*"]
-CORS(app, origins=_allowed_origins)
+CORS(app, origins=["*"])
 
 DATABASE_URL      = os.getenv("DATABASE_URL", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL   = "claude-haiku-4-5"
-
-# ---------------------------------------------------------------------------
-# Password login + signed-token auth (Path 3)
-# ---------------------------------------------------------------------------
-# How it works:
-#   1. User POSTs the password to /api/login
-#   2. If correct, we issue an HMAC-signed token (like a minimal JWT) that
-#      encodes an expiry timestamp. The token is signed with AUTH_SIGNING_SECRET
-#      so it can't be forged.
-#   3. The frontend stores the token and sends it as "Authorization: Bearer <token>"
-#      on every subsequent request.
-#   4. before_request verifies the signature + expiry on protected endpoints.
-#
-# The password itself is NEVER stored in the frontend — only the derived,
-# expiring token. Viewing page source reveals nothing useful.
-#
-# Two env vars on Render:
-#   AUTH_PASSWORD        — the login password (plain text; compared in constant time)
-#   AUTH_SIGNING_SECRET  — a long random string used to sign tokens
-#
-# If AUTH_PASSWORD is unset, the gate FAILS OPEN (disabled) so you can deploy
-# the code first and configure the password second without locking yourself out.
-# ---------------------------------------------------------------------------
-AUTH_PASSWORD       = os.getenv("AUTH_PASSWORD", "").strip()
-AUTH_SIGNING_SECRET = os.getenv("AUTH_SIGNING_SECRET", "").strip()
-# If no signing secret is configured, generate an ephemeral one at boot. This
-# means tokens survive only until the next restart when the secret is unset —
-# fine for fail-open mode, but you SHOULD set AUTH_SIGNING_SECRET in production
-# so tokens persist across Render restarts/sleeps.
-if not AUTH_SIGNING_SECRET:
-    AUTH_SIGNING_SECRET = secrets.token_urlsafe(48)
-
-TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60   # 30-day session
-
-# Paths that never require a token (health check, login itself, preflight)
-_AUTH_EXEMPT_PATHS = {"/", "/health", "/api/login"}
-
-
-def _b64url_encode(raw: bytes) -> str:
-    """URL-safe base64 without padding."""
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def _b64url_decode(s: str) -> bytes:
-    """Reverse of _b64url_encode — re-add padding before decoding."""
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-
-def _issue_token(ttl_seconds: int = TOKEN_TTL_SECONDS) -> str:
-    """
-    Create an HMAC-signed token: base64(payload).base64(signature)
-    payload = {"exp": <unix expiry>, "iat": <unix issued-at>}
-    """
-    payload = {"exp": int(time.time()) + ttl_seconds, "iat": int(time.time())}
-    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
-    sig = hmac.new(
-        AUTH_SIGNING_SECRET.encode(), payload_b64.encode(), hashlib.sha256
-    ).digest()
-    sig_b64 = _b64url_encode(sig)
-    return f"{payload_b64}.{sig_b64}"
-
-
-def _verify_token(token: str) -> bool:
-    """Verify token signature + expiry. Returns True if valid."""
-    try:
-        payload_b64, sig_b64 = token.split(".", 1)
-        # Recompute the signature and compare in constant time
-        expected_sig = hmac.new(
-            AUTH_SIGNING_SECRET.encode(), payload_b64.encode(), hashlib.sha256
-        ).digest()
-        provided_sig = _b64url_decode(sig_b64)
-        if not hmac.compare_digest(expected_sig, provided_sig):
-            return False
-        # Signature valid — now check expiry
-        payload = json.loads(_b64url_decode(payload_b64))
-        if int(payload.get("exp", 0)) < int(time.time()):
-            return False
-        return True
-    except Exception:
-        return False
-
-
-@app.before_request
-def _require_auth():
-    """Reject any request lacking a valid Bearer token on protected paths."""
-    # Always allow CORS preflight
-    if request.method == "OPTIONS":
-        return None
-    # Allow exempt paths (health check, login)
-    if request.path in _AUTH_EXEMPT_PATHS:
-        return None
-    # Fail OPEN if no password configured (lets you deploy before configuring)
-    if not AUTH_PASSWORD:
-        return None
-    # Otherwise require a valid Bearer token
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "unauthorized — login required"}), 401
-    token = auth_header[len("Bearer "):].strip()
-    if not _verify_token(token):
-        return jsonify({"error": "unauthorized — invalid or expired session"}), 401
-    return None
-
-
-# Simple in-memory brute-force guard for the login endpoint.
-# Tracks failed attempts per IP; locks out after too many within a window.
-# Resets on restart (fine for single-user). Not decorator-based because the
-# limiter object is defined later in the file.
-_login_attempts: dict[str, list[float]] = {}
-_LOGIN_MAX_ATTEMPTS = 8           # max failed attempts...
-_LOGIN_WINDOW_SECONDS = 15 * 60   # ...within this rolling window
-_LOGIN_LOCKOUT_SECONDS = 15 * 60  # lockout duration once exceeded
-
-
-def _login_rate_ok(ip: str) -> bool:
-    """Return True if this IP is allowed another login attempt."""
-    now = time.time()
-    attempts = _login_attempts.get(ip, [])
-    # Drop attempts outside the window
-    attempts = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]
-    _login_attempts[ip] = attempts
-    return len(attempts) < _LOGIN_MAX_ATTEMPTS
-
-
-def _record_login_failure(ip: str) -> None:
-    _login_attempts.setdefault(ip, []).append(time.time())
-
-
-@app.route("/api/login", methods=["POST"])
-def login():
-    """
-    Exchange the password for a signed session token.
-
-    Body: { "password": "..." }
-    Returns: { "token": "...", "expires_in": <seconds> }
-    """
-    # If auth is disabled (no password set), issue a token anyway so the
-    # frontend flow works uniformly.
-    if not AUTH_PASSWORD:
-        return jsonify({
-            "token": _issue_token(),
-            "expires_in": TOKEN_TTL_SECONDS,
-            "auth_disabled": True,
-        }), 200
-
-    # Brute-force guard
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-    if not _login_rate_ok(ip):
-        return jsonify({
-            "error": "too many failed attempts — wait 15 minutes and try again"
-        }), 429
-
-    body = request.get_json(silent=True) or {}
-    provided = (body.get("password") or "")
-    # Constant-time comparison to avoid timing attacks
-    if not hmac.compare_digest(provided, AUTH_PASSWORD):
-        _record_login_failure(ip)
-        return jsonify({"error": "incorrect password"}), 401
-
-    # Success — clear this IP's failure history
-    _login_attempts.pop(ip, None)
-    return jsonify({
-        "token": _issue_token(),
-        "expires_in": TOKEN_TTL_SECONDS,
-    }), 200
-
-
-# ---------------------------------------------------------------------------
-# Rate limiting (Flask-Limiter) — caps damage from runaway scripts even if
-# the API key leaks. Limits are per-IP.
-#   - AI / expensive endpoints: 50/hour
-#   - Read-only endpoints:      200/hour
-# Uses in-memory storage (resets on Render restart — fine for a single dyno).
-# ---------------------------------------------------------------------------
-try:
-    from flask_limiter import Limiter
-    from flask_limiter.util import get_remote_address
-
-    limiter = Limiter(
-        key_func=get_remote_address,
-        app=app,
-        default_limits=["200 per hour"],   # default for any endpoint not decorated
-        storage_uri="memory://",
-    )
-    RATE_LIMIT_AVAILABLE = True
-except ImportError:
-    # flask_limiter not installed yet — define a no-op decorator so the app
-    # still boots. Add 'Flask-Limiter' to requirements.txt to enable.
-    logger.warning(
-        "flask_limiter not installed — rate limiting disabled. "
-        "Add 'Flask-Limiter' to requirements.txt to enable."
-    )
-    RATE_LIMIT_AVAILABLE = False
-
-    class _NoOpLimiter:
-        def limit(self, *a, **k):
-            def deco(f):
-                return f
-            return deco
-    limiter = _NoOpLimiter()
-
-# Convenience decorators — apply to routes below
-AI_RATE_LIMIT   = "50 per hour"    # expensive: AI-backed endpoints
-READ_RATE_LIMIT = "200 per hour"   # cheaper: read-only data
 
 anthropic_client: Optional[Anthropic] = None
 if ANTHROPIC_API_KEY:
@@ -358,7 +134,7 @@ def _fetch_price_data(symbol: str) -> Optional[dict]:
 
         last = close.iloc[-1]
         prev = close.iloc[-2]
-        pct_1d = ((last - prev) / prev) * 100
+        pct_1d = ((last - prev) / prev) * 100 if prev != 0 else 0.0
 
         vol_20d_avg = volume.iloc[-20:].mean()
         vol_today   = volume.iloc[-1]
@@ -400,8 +176,8 @@ def _fetch_price_data(symbol: str) -> Optional[dict]:
 
             "high_52w":   round(high_52w, 2),
             "low_52w":    round(low_52w, 2),
-            "pct_from_52w_high": round((last - high_52w) / high_52w * 100, 2),
-            "pct_from_52w_low":  round((last - low_52w)  / low_52w  * 100, 2),
+            "pct_from_52w_high": round((last - high_52w) / high_52w * 100, 2) if high_52w and high_52w == high_52w else 0.0,
+            "pct_from_52w_low":  round((last - low_52w)  / low_52w  * 100, 2) if low_52w  and low_52w  == low_52w  else 0.0,
 
             "pct_change_5d":  round(((last - close.iloc[-6])  / close.iloc[-6])  * 100, 2) if len(close) > 5 else 0.0,
             "pct_change_30d": round(((last - close.iloc[-21]) / close.iloc[-21]) * 100, 2) if len(close) > 20 else 0.0,
@@ -858,7 +634,6 @@ GUARDRAILS
 # Endpoints
 # ---------------------------------------------------------------------------
 @app.route("/api/options", methods=["POST"])
-@limiter.limit(AI_RATE_LIMIT)
 def get_options():
     """Standalone options-only analysis (faster — no AI call)."""
     data   = request.get_json(silent=True) or {}
@@ -903,7 +678,6 @@ def get_options():
 
 
 @app.route("/api/analyze", methods=["POST"])
-@limiter.limit(AI_RATE_LIMIT)
 def analyze_stock():
     if not anthropic_client:
         return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
@@ -1365,7 +1139,6 @@ GUARDRAILS
 
 
 @app.route("/api/compare", methods=["POST"])
-@limiter.limit(AI_RATE_LIMIT)
 def compare_stocks():
     """
     Compare 2 NSE stocks side-by-side.
@@ -1603,7 +1376,6 @@ GUARDRAILS
 
 
 @app.route("/api/strategy", methods=["POST"])
-@limiter.limit(AI_RATE_LIMIT)
 def get_strategy():
     """
     Recommend options strategy for a symbol.
@@ -1975,7 +1747,6 @@ decisions they can act on TODAY, not generic advice."""
 
 
 @app.route("/api/position", methods=["POST"])
-@limiter.limit(AI_RATE_LIMIT)
 def get_position_insights():
     """
     AI-powered insights on an existing position.
@@ -2316,40 +2087,8 @@ def _compute_trade_levels(
             "nearest_resistance":  nearest_resistance,
             "nearest_support":     nearest_support,
             "analyst_target":      analyst_target,
-            # Top 2 Call OI strikes (highest open interest = strongest resistance walls)
-            # and top 2 Put OI strikes (strongest support walls). Sorted by OI desc.
-            "top_call_oi_strikes": _top_n_oi_strikes(options_data, "call", n=2),
-            "top_put_oi_strikes":  _top_n_oi_strikes(options_data, "put",  n=2),
         },
     }
-
-
-def _top_n_oi_strikes(options_data, side: str, n: int = 2) -> list[dict]:
-    """
-    Extract the top-N strikes by Open Interest from the option chain.
-
-    Args:
-      options_data: OptionChainData object (may be None for non-F&O)
-      side: "call" or "put" — which side's OI to rank by
-      n: how many top strikes to return
-
-    Returns:
-      List of {strike: float, oi: int} dicts sorted by OI descending.
-      Empty list if no options data or no strikes available.
-    """
-    if options_data is None or not options_data.top_strikes:
-        return []
-    oi_key = "call_oi" if side == "call" else "put_oi"
-    # Sort all strikes by OI descending, filter out zero-OI entries
-    sorted_strikes = sorted(
-        [s for s in options_data.top_strikes if s.get(oi_key, 0) > 0],
-        key=lambda s: s[oi_key],
-        reverse=True,
-    )
-    return [
-        {"strike": float(s["strike"]), "oi": int(s[oi_key])}
-        for s in sorted_strikes[:n]
-    ]
 
 
 def _t2_rationale(is_long, t2, nr, ns, at, h52, l52):
@@ -2829,7 +2568,6 @@ serious about discipline. Use specific ₹ values when relevant. Maximum 900 wor
 
 
 @app.route("/api/trade-plan", methods=["POST"])
-@limiter.limit(AI_RATE_LIMIT)
 def get_trade_plan():
     """
     Generate a concrete trade plan with algorithmic levels + AI commentary.
@@ -3988,7 +3726,6 @@ better, say so clearly. Max 700 words."""
 
 
 @app.route("/api/peer-comparison", methods=["POST"])
-@limiter.limit(AI_RATE_LIMIT)
 def get_peer_comparison():
     """
     Compare the target stock against 3 peer stocks for a chosen direction.
@@ -4146,7 +3883,6 @@ def _current_spot_for_open(symbol: str) -> Optional[float]:
 
 
 @app.route("/api/journal", methods=["GET"])
-@limiter.limit(READ_RATE_LIMIT)
 def journal_list():
     """
     List trades. Query params:
@@ -4232,7 +3968,6 @@ def journal_get(trade_id: int):
 
 
 @app.route("/api/journal", methods=["POST"])
-@limiter.limit(READ_RATE_LIMIT)
 def journal_create():
     """
     Create a new trade entry.
