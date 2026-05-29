@@ -89,13 +89,27 @@ class OptionChainData:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+def _safe_int(val, default=0) -> int:
+    try:
+        return int(val or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(val, default=0.0) -> float:
+    try:
+        return float(val or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _extract_market_data(option_block: dict) -> tuple[int, int, int, float, float]:
     md = (option_block or {}).get("market_data") or {}
-    oi          = int(md.get("oi", 0) or 0)
-    prev_oi     = int(md.get("prev_oi", 0) or 0)
-    volume      = int(md.get("volume", 0) or 0)
-    close_price = float(md.get("close_price", 0) or 0)
-    ltp         = float(md.get("ltp", 0) or 0)
+    oi          = _safe_int(md.get("oi", 0))
+    prev_oi     = _safe_int(md.get("prev_oi", 0))
+    volume      = _safe_int(md.get("volume", 0))
+    close_price = _safe_float(md.get("close_price", 0))
+    ltp         = _safe_float(md.get("ltp", 0))
     if ltp <= 0 and close_price > 0:
         ltp = close_price
     return oi, prev_oi, volume, close_price, ltp
