@@ -523,8 +523,8 @@ def compute_aggregate_stats(closed_trades: list[dict]) -> dict:
         "win_rate":       round(len(winners) / len(closed_trades) * 100, 1) if closed_trades else 0,
         "avg_r_multiple": round(sum(r_multiples) / len(r_multiples), 2) if r_multiples else None,
         "total_pnl":      round(sum(pnls), 2),
-        "best_trade":     {"symbol": best["symbol"], "pnl": best.get("realized_pnl", 0), "r": best.get("r_multiple")},
-        "worst_trade":    {"symbol": worst["symbol"], "pnl": worst.get("realized_pnl", 0), "r": worst.get("r_multiple")},
+        "best_trade":     {"symbol": best.get("symbol", "Unknown"), "pnl": best.get("realized_pnl", 0), "r": best.get("r_multiple")},
+        "worst_trade":    {"symbol": worst.get("symbol", "Unknown"), "pnl": worst.get("realized_pnl", 0), "r": worst.get("r_multiple")},
         "avg_days_held":  round(sum(days_held_list) / len(days_held_list), 1) if days_held_list else None,
         "by_setup":       by_setup,
     }
