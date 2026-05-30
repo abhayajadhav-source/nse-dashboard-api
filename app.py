@@ -405,6 +405,321 @@ def get_market_context():
 
 
 # ---------------------------------------------------------------------------
+# Risk Dashboard — portfolio-level view of open journal positions
+# ---------------------------------------------------------------------------
+# Reads all OPEN trades from trading_journal, fetches live spot + beta from
+# Yahoo for each, then computes:
+#   - Exposure: capital deployed (entry-based) vs current value (MTM)
+#   - Concentration: per-symbol %, per-sector %, long/short skew
+#   - Stress test: portfolio impact for NIFTY moves -10/-5/-2/0/+2/+5%
+#
+# Beta is fetched per-symbol from Yahoo (5-year against the index). Falls
+# back to 1.0 if missing. Parallel fetches via ThreadPoolExecutor keep
+# the endpoint usable even with many positions.
+# ---------------------------------------------------------------------------
+
+def _fetch_symbol_risk_data(symbol: str) -> dict:
+    """
+    Fetch live price + beta + sector for a single symbol.
+    Best-effort: returns sensible defaults on any failure rather than raising.
+    """
+    yf_symbol = f"{symbol}.NS"
+    out = {
+        "current_price": None,
+        "beta":          1.0,    # default to market-beta if unknown
+        "sector":        "Unknown",
+    }
+    try:
+        t = yf.Ticker(yf_symbol)
+        info = t.info or {}
+        # Current price — try multiple keys, Yahoo's shape varies
+        price = (info.get("currentPrice")
+                 or info.get("regularMarketPrice")
+                 or info.get("previousClose"))
+        if price:
+            out["current_price"] = float(price)
+        # Beta (5-year vs NIFTY for .NS tickers)
+        beta = info.get("beta")
+        if beta is not None and not (isinstance(beta, float) and beta != beta):  # NaN check
+            out["beta"] = round(float(beta), 2)
+        # Sector — useful for concentration breakdown
+        sector = info.get("sector")
+        if sector:
+            out["sector"] = sector
+    except Exception as e:
+        logger.warning("Risk data fetch failed for %s: %s", symbol, e)
+    return out
+
+
+def _classify_concentration(pct: float, kind: str) -> Optional[str]:
+    """
+    Return a warning level for a given concentration percentage.
+    kind: 'symbol' | 'sector' | 'direction' | 'deployment'
+    """
+    if kind == "symbol":
+        if pct > 30: return "danger"   # >30% in one name is dangerous
+        if pct > 20: return "warning"  # >20% is concerning
+        return None
+    if kind == "sector":
+        if pct > 50: return "danger"
+        if pct > 35: return "warning"
+        return None
+    if kind == "direction":
+        # Direction skew: pct here is the ABS difference between long & short
+        if pct > 80: return "warning"  # >80% one-sided
+        return None
+    if kind == "deployment":
+        if pct > 100: return "danger"  # over-deployed (leveraged)
+        if pct > 80:  return "warning"
+        return None
+    return None
+
+
+@app.route("/api/risk-dashboard")
+@limiter.limit(READ_RATE_LIMIT)
+def get_risk_dashboard():
+    """Compute portfolio-level risk view across all open journal positions."""
+    # journal_store is imported later in the file; do a lazy import here so
+    # this endpoint definition stays self-contained and the module loads
+    # even if journal_store has a problem.
+    try:
+        import journal_store
+    except Exception as e:
+        logger.exception("Risk dashboard: journal_store unavailable")
+        return jsonify({"error": f"Journal module unavailable: {e}"}), 500
+
+    try:
+        # Fetch all open positions from the journal
+        positions_raw = journal_store.list_trades(status="open", limit=200)
+    except Exception as e:
+        logger.exception("Risk dashboard: failed to list open trades")
+        return jsonify({"error": f"Failed to load open positions: {e}"}), 500
+
+    if not positions_raw:
+        # Empty book — still return a valid response so frontend can render "no positions" state
+        return jsonify({
+            "as_of":         datetime.utcnow().isoformat() + "Z",
+            "positions":     [],
+            "summary": {
+                "total_positions":      0,
+                "long_positions":       0,
+                "short_positions":      0,
+                "hedged_positions":     0,
+                "capital_at_entry":     0,
+                "current_value":        0,
+                "total_unrealized_pnl": 0,
+                "total_unrealized_pct": 0,
+                "long_exposure":        0,
+                "short_exposure":       0,
+                "net_exposure":         0,
+            },
+            "concentration": {
+                "by_symbol":    [],
+                "by_sector":    [],
+                "by_direction": {"long_pct": 0, "short_pct": 0, "hedged_pct": 0, "skew": "empty"},
+            },
+            "stress_test":   {"scenarios": []},
+            "warnings":      [],
+        }), 200
+
+    # Parallel-fetch live data for all symbols
+    # Dedupe — if user has 2 RELIANCE positions, only fetch RELIANCE once
+    unique_symbols = list(set(p["symbol"] for p in positions_raw))
+    symbol_data = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(unique_symbols))) as executor:
+        future_map = {executor.submit(_fetch_symbol_risk_data, s): s for s in unique_symbols}
+        for future in future_map:
+            sym = future_map[future]
+            try:
+                symbol_data[sym] = future.result(timeout=10)
+            except Exception as e:
+                logger.warning("Risk data future failed for %s: %s", sym, e)
+                symbol_data[sym] = {"current_price": None, "beta": 1.0, "sector": "Unknown"}
+
+    # Enrich each position with live data + per-position metrics
+    enriched = []
+    for p in positions_raw:
+        sym = p["symbol"]
+        live = symbol_data.get(sym, {"current_price": None, "beta": 1.0, "sector": "Unknown"})
+        qty   = int(p.get("qty") or 0)
+        entry = float(p.get("entry_price") or 0)
+        cur   = live["current_price"] if live["current_price"] else entry
+        direction = (p.get("direction") or "long").lower()
+
+        capital_at_entry = qty * entry
+        current_value    = qty * cur
+        # Unrealized P&L respects direction sign
+        if direction == "short":
+            unrealized = (entry - cur) * qty
+        else:  # long or hedged — both have positive delta exposure
+            unrealized = (cur - entry) * qty
+        unrealized_pct = (unrealized / capital_at_entry * 100) if capital_at_entry else 0
+
+        enriched.append({
+            "id":                 p.get("id"),
+            "symbol":             sym,
+            "direction":          direction,
+            "qty":                qty,
+            "entry_price":        entry,
+            "current_price":      cur,
+            "sector":             live["sector"],
+            "beta":               live["beta"],
+            "capital_at_entry":   round(capital_at_entry, 2),
+            "current_value":      round(current_value, 2),
+            "unrealized_pnl":     round(unrealized, 2),
+            "unrealized_pnl_pct": round(unrealized_pct, 2),
+            "entry_date":         p.get("entry_date"),
+            "stop_loss":          p.get("stop_loss"),
+        })
+
+    # ----- Aggregate summary -----
+    total_capital_entry  = sum(p["capital_at_entry"] for p in enriched)
+    total_current_value  = sum(p["current_value"] for p in enriched)
+    total_unrealized     = sum(p["unrealized_pnl"] for p in enriched)
+    long_exposure  = sum(p["current_value"] for p in enriched if p["direction"] in ("long", "hedged"))
+    short_exposure = sum(p["current_value"] for p in enriched if p["direction"] == "short")
+    net_exposure   = long_exposure - short_exposure
+
+    summary = {
+        "total_positions":      len(enriched),
+        "long_positions":       sum(1 for p in enriched if p["direction"] == "long"),
+        "short_positions":      sum(1 for p in enriched if p["direction"] == "short"),
+        "hedged_positions":     sum(1 for p in enriched if p["direction"] == "hedged"),
+        "capital_at_entry":     round(total_capital_entry, 2),
+        "current_value":        round(total_current_value, 2),
+        "total_unrealized_pnl": round(total_unrealized, 2),
+        "total_unrealized_pct": round((total_unrealized / total_capital_entry * 100) if total_capital_entry else 0, 2),
+        "long_exposure":        round(long_exposure, 2),
+        "short_exposure":       round(short_exposure, 2),
+        "net_exposure":         round(net_exposure, 2),
+    }
+
+    # ----- Concentration -----
+    # By symbol (largest first)
+    by_symbol_raw = {}
+    for p in enriched:
+        by_symbol_raw[p["symbol"]] = by_symbol_raw.get(p["symbol"], 0) + p["current_value"]
+    by_symbol = [
+        {
+            "symbol":        sym,
+            "capital":       round(val, 2),
+            "pct_of_book":   round((val / total_current_value * 100) if total_current_value else 0, 2),
+            "warning":       _classify_concentration((val / total_current_value * 100) if total_current_value else 0, "symbol"),
+        }
+        for sym, val in sorted(by_symbol_raw.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+
+    # By sector
+    by_sector_raw = {}
+    for p in enriched:
+        sec = p["sector"] or "Unknown"
+        by_sector_raw[sec] = by_sector_raw.get(sec, 0) + p["current_value"]
+    by_sector = [
+        {
+            "sector":      sec,
+            "capital":     round(val, 2),
+            "pct_of_book": round((val / total_current_value * 100) if total_current_value else 0, 2),
+            "warning":     _classify_concentration((val / total_current_value * 100) if total_current_value else 0, "sector"),
+        }
+        for sec, val in sorted(by_sector_raw.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+
+    # Direction skew
+    if total_current_value > 0:
+        long_pct   = round(long_exposure  / total_current_value * 100, 2)
+        short_pct  = round(short_exposure / total_current_value * 100, 2)
+        hedged_val = sum(p["current_value"] for p in enriched if p["direction"] == "hedged")
+        hedged_pct = round(hedged_val / total_current_value * 100, 2)
+    else:
+        long_pct = short_pct = hedged_pct = 0
+    if long_pct >= 90:    skew = "long_heavy"
+    elif short_pct >= 90: skew = "short_heavy"
+    elif abs(long_pct - short_pct) <= 20: skew = "balanced"
+    else: skew = "long_tilted" if long_pct > short_pct else "short_tilted"
+
+    concentration = {
+        "by_symbol":    by_symbol,
+        "by_sector":    by_sector,
+        "by_direction": {
+            "long_pct":  long_pct,
+            "short_pct": short_pct,
+            "hedged_pct": hedged_pct,
+            "skew":      skew,
+        },
+    }
+
+    # ----- Stress test -----
+    # For each NIFTY scenario, compute portfolio P&L impact.
+    # long: position_change = value * beta * nifty_pct
+    # short: position_change = -value * beta * nifty_pct
+    # hedged: ~half delta exposure (long + protective put roughly = +0.5 delta)
+    nifty_scenarios = [-10, -5, -2, 0, 2, 5]
+    scenarios = []
+    for nf_pct in nifty_scenarios:
+        portfolio_change = 0
+        for p in enriched:
+            val  = p["current_value"]
+            beta = p["beta"]
+            d    = p["direction"]
+            if d == "long":
+                portfolio_change += val * beta * (nf_pct / 100)
+            elif d == "short":
+                portfolio_change -= val * beta * (nf_pct / 100)
+            elif d == "hedged":
+                portfolio_change += val * beta * (nf_pct / 100) * 0.5
+        portfolio_change_pct = (portfolio_change / total_current_value * 100) if total_current_value else 0
+        scenarios.append({
+            "nifty_pct":            nf_pct,
+            "portfolio_change":     round(portfolio_change, 2),
+            "portfolio_change_pct": round(portfolio_change_pct, 2),
+        })
+
+    # ----- Warnings (cross-cutting) -----
+    warnings_list = []
+    # Direction skew warning
+    if abs(long_pct - short_pct) > 80 and total_current_value > 0:
+        warnings_list.append({
+            "level":   "warning",
+            "kind":    "direction_skew",
+            "message": f"Book is heavily {'long' if long_pct > short_pct else 'short'}-tilted "
+                       f"({max(long_pct, short_pct):.0f}% one-sided). Vulnerable to market direction.",
+        })
+    # Top symbol concentration
+    if by_symbol and by_symbol[0]["warning"] in ("warning", "danger"):
+        warnings_list.append({
+            "level":   by_symbol[0]["warning"],
+            "kind":    "symbol_concentration",
+            "message": f"{by_symbol[0]['symbol']} is {by_symbol[0]['pct_of_book']:.0f}% of the book "
+                       "— consider trimming or hedging.",
+        })
+    # Top sector concentration
+    if by_sector and by_sector[0]["warning"] in ("warning", "danger"):
+        warnings_list.append({
+            "level":   by_sector[0]["warning"],
+            "kind":    "sector_concentration",
+            "message": f"{by_sector[0]['sector']} sector is {by_sector[0]['pct_of_book']:.0f}% "
+                       "of the book — diversify or hedge sector risk.",
+        })
+    # Worst-case stress test severity
+    worst = min((s["portfolio_change_pct"] for s in scenarios), default=0)
+    if worst < -8:
+        warnings_list.append({
+            "level":   "warning",
+            "kind":    "stress_severity",
+            "message": f"Under -10% NIFTY scenario, book would drop {worst:.1f}%. Consider hedges.",
+        })
+
+    return jsonify({
+        "as_of":         datetime.utcnow().isoformat() + "Z",
+        "positions":     enriched,
+        "summary":       summary,
+        "concentration": concentration,
+        "stress_test":   {"scenarios": scenarios},
+        "warnings":      warnings_list,
+    }), 200
+
+
+# ---------------------------------------------------------------------------
 # Price data + indicators
 # ---------------------------------------------------------------------------
 def _fetch_price_data(symbol: str) -> Optional[dict]:
