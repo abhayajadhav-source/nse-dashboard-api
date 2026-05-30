@@ -720,6 +720,428 @@ def get_risk_dashboard():
 
 
 # ---------------------------------------------------------------------------
+# Hedge Suggestions — concrete hedging plays for the current book
+# ---------------------------------------------------------------------------
+# Reviews the open positions + risk metrics and suggests specific hedges
+# across multiple categories:
+#   - Same-stock options:  protective put, covered call, collar
+#   - Same-stock futures:  short futures of a long position (or vice versa)
+#   - Sector pair trade:   long X / short peer Y (via peer_map.py)
+#   - Index hedge:         NIFTY/BANKNIFTY puts or short futures
+#   - Diversification:     trim suggestions when over-concentrated
+#
+# Two-layer design:
+#   1. Algorithmic layer identifies top 3-5 risks and maps each to
+#      concrete hedge candidates with sizing + cost estimates.
+#   2. AI layer (Claude Haiku) reviews the algo output, prioritizes,
+#      writes rationale + trade-offs in plain language.
+#
+# Takes the risk-dashboard data as a POST body to avoid re-fetching
+# Yahoo data (which is slow). Frontend reuses the already-loaded
+# risk dashboard data.
+# ---------------------------------------------------------------------------
+
+def _build_algo_hedge_candidates(positions: list, summary: dict,
+                                 concentration: dict, warnings: list) -> list[dict]:
+    """
+    Rule-based hedge candidates derived from the book.
+    Each candidate is a structured dict that the AI layer will refine.
+    """
+    candidates = []
+    by_symbol = concentration.get("by_symbol", []) or []
+    by_sector = concentration.get("by_sector", []) or []
+    by_direction = concentration.get("by_direction", {}) or {}
+    long_pct  = by_direction.get("long_pct", 0)
+    short_pct = by_direction.get("short_pct", 0)
+    total_value = summary.get("current_value", 0) or 0
+
+    # Lookup table: symbol -> position dict (for quick access)
+    pos_map = {p["symbol"]: p for p in positions}
+
+    # ---------- Category 1: Single-name concentration ----------
+    # Top concentrated symbol gets BOTH options and futures hedge suggestions
+    for s in by_symbol[:2]:   # top-2 concentrations
+        if s["pct_of_book"] < 15:
+            continue            # not concentrated enough to merit a hedge
+        sym = s["symbol"]
+        pos = pos_map.get(sym)
+        if not pos:
+            continue
+        direction = pos["direction"]
+        qty       = pos["qty"]
+        price     = pos["current_price"]
+        sector    = pos.get("sector", "Unknown")
+
+        # 1a. Protective put / call (most natural same-stock hedge)
+        if direction in ("long", "hedged"):
+            # Long position: buy a protective put — strike ~5-7% OTM (ATM is expensive)
+            target_strike = round(price * 0.95 / 10) * 10   # round to nearest 10
+            candidates.append({
+                "category":         "symbol_concentration",
+                "risk_addressed":   f"{sym} is {s['pct_of_book']:.0f}% of book — single-name event risk",
+                "instrument_type":  "protective_put",
+                "instrument_label": f"Buy {sym} {target_strike} PE (next monthly expiry)",
+                "direction":        "buy",
+                "sizing_hint":      f"1 PE lot per ~{NSE_LOT_SIZES.get(sym, 0) or 1} shares "
+                                    f"(your position = {qty} shares → ~{max(1, qty // (NSE_LOT_SIZES.get(sym, 0) or 1))} lot{'s' if qty // (NSE_LOT_SIZES.get(sym, 0) or 1) > 1 else ''})",
+                "cost_estimate":    f"Premium typically 1-2% of underlying for a 5% OTM put. "
+                                    f"For 1 lot, premium roughly ₹{int(price * (NSE_LOT_SIZES.get(sym, 0) or 1) * 0.015):,}–₹{int(price * (NSE_LOT_SIZES.get(sym, 0) or 1) * 0.025):,}",
+                "max_loss_capped":  f"Below ₹{target_strike}, losses fully capped (minus premium)",
+                "tradeoff":         "Costs premium upfront; bleeds theta if stock stays flat",
+                "exit_signal":      f"Close hedge if {sym} decisively breaks above ₹{round(price * 1.05, 2)} (your concentration becomes a winner, not a risk)",
+            })
+
+            # 1b. Covered call (income-generating hedge — caps upside)
+            call_strike = round(price * 1.05 / 10) * 10
+            candidates.append({
+                "category":         "symbol_concentration",
+                "risk_addressed":   f"{sym} concentration with neutral-to-mild-upward outlook",
+                "instrument_type":  "covered_call",
+                "instrument_label": f"Sell {sym} {call_strike} CE (next monthly expiry)",
+                "direction":        "sell",
+                "sizing_hint":      f"1 CE lot per ~{NSE_LOT_SIZES.get(sym, 0) or 1} shares of underlying",
+                "cost_estimate":    f"Premium received: roughly 0.8-1.5% of underlying "
+                                    f"(~₹{int(price * (NSE_LOT_SIZES.get(sym, 0) or 1) * 0.01):,}–₹{int(price * (NSE_LOT_SIZES.get(sym, 0) or 1) * 0.015):,} per lot collected)",
+                "max_loss_capped":  f"Not a downside hedge — generates income, caps upside above ₹{call_strike}",
+                "tradeoff":         f"You lose participation above ₹{call_strike}. Best when you're bullish but not euphoric on the stock.",
+                "exit_signal":      f"Close call if stock approaches strike (₹{call_strike}) and you still want upside",
+            })
+
+            # 1c. Collar (zero-cost hedge combining put buy + call sell)
+            candidates.append({
+                "category":         "symbol_concentration",
+                "risk_addressed":   f"{sym} concentration — defined-range protection at minimal cost",
+                "instrument_type":  "collar",
+                "instrument_label": f"Buy {target_strike} PE + Sell {call_strike} CE (same expiry)",
+                "direction":        "buy_put_sell_call",
+                "sizing_hint":      f"Equal lots: 1 PE + 1 CE per ~{NSE_LOT_SIZES.get(sym, 0) or 1} shares",
+                "cost_estimate":    "Near zero net premium (call premium offsets put premium). Some skew may leave a small credit or debit.",
+                "max_loss_capped":  f"Below ₹{target_strike}: protected. Above ₹{call_strike}: capped.",
+                "tradeoff":         f"Locks you in a {round((call_strike/target_strike - 1)*100)}% range. Gives up unlimited upside.",
+                "exit_signal":      "Unwind if your view on the stock changes materially (either side)",
+            })
+
+            # 1d. Short futures (full hedge, no premium, but margin-heavy)
+            candidates.append({
+                "category":         "symbol_concentration",
+                "risk_addressed":   f"{sym} concentration — neutralize directional exposure without paying premium",
+                "instrument_type":  "short_futures",
+                "instrument_label": f"Short {sym} futures (next monthly expiry)",
+                "direction":        "sell",
+                "sizing_hint":      f"Short {max(1, qty // (NSE_LOT_SIZES.get(sym, 0) or 1))} lot{'s' if qty // (NSE_LOT_SIZES.get(sym, 0) or 1) > 1 else ''} to fully neutralize",
+                "cost_estimate":    "No premium. Margin requirement: typically ₹1-2L per lot (depends on stock + SPAN/exposure margin).",
+                "max_loss_capped":  "Hedge is symmetric — fully offsets stock moves in either direction",
+                "tradeoff":         "Locks in current value. Gives up ALL upside on the hedged portion. Requires margin (capital efficiency low).",
+                "exit_signal":      "Cover futures when you want directional exposure back (typically after the risk catalyst passes — e.g., post-earnings)",
+            })
+
+        elif direction == "short":
+            # Short position: protective call (analogous to put for longs)
+            target_strike = round(price * 1.05 / 10) * 10
+            candidates.append({
+                "category":         "symbol_concentration",
+                "risk_addressed":   f"Short {sym} ({s['pct_of_book']:.0f}% of book) — unlimited upside risk",
+                "instrument_type":  "protective_call",
+                "instrument_label": f"Buy {sym} {target_strike} CE (next monthly expiry)",
+                "direction":        "buy",
+                "sizing_hint":      f"1 CE lot per ~{NSE_LOT_SIZES.get(sym, 0) or 1} shares short",
+                "cost_estimate":    f"Premium 1-2% of underlying (~₹{int(price * (NSE_LOT_SIZES.get(sym, 0) or 1) * 0.015):,} per lot)",
+                "max_loss_capped":  f"Above ₹{target_strike}: short losses capped",
+                "tradeoff":         "Costs premium; theta decay if stock stays flat",
+                "exit_signal":      f"Close hedge if {sym} decisively breaks below ₹{round(price * 0.95, 2)}",
+            })
+
+    # ---------- Category 2: Sector concentration ----------
+    # Top-1 sector if >35% gets BOTH index hedge and pair trade suggestions
+    if by_sector and by_sector[0].get("pct_of_book", 0) >= 35:
+        top_sector = by_sector[0]
+        sector_name = top_sector["sector"]
+
+        # 2a. Sector index hedge (BANKNIFTY for banks, NIFTY otherwise)
+        # Indian retail: most sector hedging routes through BANKNIFTY for financials,
+        # otherwise NIFTY is the only liquid index choice.
+        index_choice = "BANKNIFTY" if "bank" in sector_name.lower() or "financial" in sector_name.lower() else "NIFTY"
+        candidates.append({
+            "category":         "sector_concentration",
+            "risk_addressed":   f"{sector_name} is {top_sector['pct_of_book']:.0f}% of book — sector-wide shock risk",
+            "instrument_type":  "index_put",
+            "instrument_label": f"Buy {index_choice} ATM PE (next monthly expiry)",
+            "direction":        "buy",
+            "sizing_hint":      f"Size to cover ~₹{int(top_sector['capital']):,} of exposure. "
+                                f"Each {index_choice} put lot covers ~₹{12_50_000 if index_choice == 'NIFTY' else 7_50_000:,} of notional at current levels (approximate).",
+            "cost_estimate":    f"{index_choice} ATM monthly put: ~1-2% of notional (~₹15,000-30,000 per lot)",
+            "max_loss_capped":  "Hedges sector beta against broad market drops",
+            "tradeoff":         "Hedges INDEX risk, not stock-specific risk. Best when your sector concentration moves with the index.",
+            "exit_signal":      f"Roll or unwind on the next monthly expiry, or close when {index_choice} bounces ≥5% off lows",
+        })
+
+        # 2b. Sector peer pair trade (long your name, short a peer in the same sector)
+        # Find the concentrated names in this sector and use peer_map to suggest a short
+        try:
+            from peer_map import get_peers
+        except ImportError:
+            get_peers = None
+
+        if get_peers:
+            # Find a position in this sector to base the pair on
+            sector_positions = [p for p in positions if p.get("sector") == sector_name and p["direction"] in ("long", "hedged")]
+            if sector_positions:
+                anchor = sorted(sector_positions, key=lambda p: p["current_value"], reverse=True)[0]
+                try:
+                    peers = get_peers(anchor["symbol"]) or []
+                    # Filter to peers NOT already in book — don't suggest shorting what you're already long
+                    held_symbols = set(p["symbol"] for p in positions)
+                    peer_candidates = [p for p in peers if p not in held_symbols][:2]
+                    if peer_candidates:
+                        peer_str = " or ".join(peer_candidates)
+                        candidates.append({
+                            "category":         "sector_concentration",
+                            "risk_addressed":   f"{sector_name} concentration — hedge sector beta while keeping {anchor['symbol']} alpha",
+                            "instrument_type":  "pair_trade",
+                            "instrument_label": f"Short {peer_str} futures (a peer of {anchor['symbol']})",
+                            "direction":        "sell",
+                            "sizing_hint":      f"Size short to ~₹{int(anchor['current_value'] * 0.5):,} (half your {anchor['symbol']} exposure) — keeps some directional bet",
+                            "cost_estimate":    "Margin for short futures: ₹1-2L per lot. No premium decay.",
+                            "max_loss_capped":  f"Reduces sector beta by ~50%. Stock-specific alpha (vs peer) stays exposed.",
+                            "tradeoff":         f"You're betting {anchor['symbol']} outperforms {peer_str}. If both rally together, the short loses money but the long makes more.",
+                            "exit_signal":      f"Cover the short if your view on relative strength changes, OR on expiry rollover",
+                        })
+                except Exception as e:
+                    logger.debug("Peer lookup failed for hedge suggestion: %s", e)
+
+    # ---------- Category 3: Direction skew ----------
+    if abs(long_pct - short_pct) >= 70 and total_value > 0:
+        # Heavily one-sided book → suggest a broad index hedge
+        # For long-heavy: buy NIFTY puts. For short-heavy: buy NIFTY calls.
+        if long_pct > short_pct:
+            candidates.append({
+                "category":         "direction_skew",
+                "risk_addressed":   f"Book is {long_pct:.0f}% long — vulnerable to broad market drawdown",
+                "instrument_type":  "index_put",
+                "instrument_label": "Buy NIFTY ATM PE (next monthly expiry) — broad market hedge",
+                "direction":        "buy",
+                "sizing_hint":      f"Cover ~50% of long exposure (₹{int(summary['long_exposure'] * 0.5):,}). "
+                                    f"NIFTY put lot covers ~₹{12_50_000:,} of notional.",
+                "cost_estimate":    "ATM monthly NIFTY put: ~₹15,000-25,000 per lot",
+                "max_loss_capped":  "Protects against systemic drawdowns; doesn't cover stock-specific drops",
+                "tradeoff":         "Premium decays. Best held only when expecting a near-term broad correction.",
+                "exit_signal":      "Close or roll on monthly expiry; or sell if NIFTY drops 5%+ (lock in profit on the hedge)",
+            })
+
+            # Alternative: short NIFTY futures (no premium, full delta hedge)
+            candidates.append({
+                "category":         "direction_skew",
+                "risk_addressed":   f"Long-heavy book — neutralize market beta without paying premium",
+                "instrument_type":  "index_short_futures",
+                "instrument_label": "Short NIFTY futures (next monthly expiry)",
+                "direction":        "sell",
+                "sizing_hint":      f"Short to beta-weighted exposure (~₹{int(summary['long_exposure'] * 0.5):,}). "
+                                    f"Each NIFTY lot = ~₹{12_50_000:,} of notional.",
+                "cost_estimate":    "Margin: ₹1.2-1.5L per lot. No premium decay.",
+                "max_loss_capped":  "Full delta hedge on the hedged portion. Symmetric.",
+                "tradeoff":         "Gives up upside on hedged portion. Capital-heavy due to margin.",
+                "exit_signal":      "Cover when you want directional exposure back, or on expiry rollover",
+            })
+        else:
+            # Short-heavy book → hedge with NIFTY calls
+            candidates.append({
+                "category":         "direction_skew",
+                "risk_addressed":   f"Book is {short_pct:.0f}% short — vulnerable to broad market rally / short squeeze",
+                "instrument_type":  "index_call",
+                "instrument_label": "Buy NIFTY ATM CE (next monthly expiry) — short-squeeze protection",
+                "direction":        "buy",
+                "sizing_hint":      f"Cover ~50% of short exposure (~₹{int(summary['short_exposure'] * 0.5):,}). "
+                                    f"NIFTY call lot covers ~₹{12_50_000:,} of notional.",
+                "cost_estimate":    "ATM monthly NIFTY call: ~₹15,000-25,000 per lot",
+                "max_loss_capped":  "Protects against systemic rallies",
+                "tradeoff":         "Premium decays. Use when you expect short-term up-move risk.",
+                "exit_signal":      "Close on monthly expiry, or unwind if NIFTY rallies 5%+",
+            })
+
+    # ---------- Category 4: Stress severity (cross-cutting) ----------
+    # If the -10% NIFTY stress shows >8% portfolio drop, suggest broader hedging
+    # This is independent of direction skew — even a balanced book can be high-beta
+    # (Note: this is a general nudge, the specific instruments above already cover it)
+
+    # ---------- Category 5: Diversification (non-derivative hedge) ----------
+    if by_symbol and by_symbol[0].get("pct_of_book", 0) >= 25:
+        top_name = by_symbol[0]["symbol"]
+        candidates.append({
+            "category":         "diversification",
+            "risk_addressed":   f"{top_name} ({by_symbol[0]['pct_of_book']:.0f}% of book) — consider reducing concentration directly",
+            "instrument_type":  "trim_position",
+            "instrument_label": f"Trim {top_name} by 30-40% and rotate capital into uncorrelated names",
+            "direction":        "sell",
+            "sizing_hint":      f"Sell ~30% of your {top_name} position. Deploy into low-correlation sectors (IT/Pharma if you're banks-heavy, etc.)",
+            "cost_estimate":    "Brokerage + STT on the trim. No ongoing cost.",
+            "max_loss_capped":  "Doesn't cap loss — but reduces single-name event risk permanently",
+            "tradeoff":         "You give up some upside if the name keeps running. Buys you peace of mind and dry powder.",
+            "exit_signal":      "N/A — this is a structural change, not a hedge to unwind",
+        })
+
+    return candidates
+
+
+def _build_hedge_ai_prompt(positions: list, summary: dict, concentration: dict,
+                           warnings: list, candidates: list) -> str:
+    """Build the prompt for Claude to refine the algo candidates."""
+    # Compact book snapshot
+    by_symbol = concentration.get("by_symbol", []) or []
+    by_sector = concentration.get("by_sector", []) or []
+    by_direction = concentration.get("by_direction", {}) or {}
+
+    book_lines = []
+    for p in positions:
+        book_lines.append(
+            f"- {p['symbol']}: {p['direction']} {p['qty']} @ ₹{p['entry_price']} "
+            f"(now ₹{p['current_price']}, value ₹{p['current_value']:,.0f}, "
+            f"beta {p['beta']}, sector {p.get('sector', 'Unknown')})"
+        )
+    book_str = "\n".join(book_lines)
+
+    cand_lines = []
+    for i, c in enumerate(candidates, 1):
+        cand_lines.append(
+            f"{i}. [{c['category']}/{c['instrument_type']}] {c['instrument_label']}\n"
+            f"   Risk: {c['risk_addressed']}\n"
+            f"   Sizing: {c['sizing_hint']}\n"
+            f"   Cost: {c['cost_estimate']}"
+        )
+    cand_str = "\n\n".join(cand_lines)
+
+    skew  = by_direction.get("skew", "unknown")
+    top_sym = by_symbol[0]["symbol"] if by_symbol else "—"
+    top_sym_pct = by_symbol[0]["pct_of_book"] if by_symbol else 0
+    top_sec = by_sector[0]["sector"] if by_sector else "—"
+    top_sec_pct = by_sector[0]["pct_of_book"] if by_sector else 0
+
+    return f"""You are a derivatives risk advisor for an Indian F&O retail trader. Review their book and the algorithmically-generated hedge candidates. Write a focused, practical hedge plan.
+
+CURRENT BOOK:
+{book_str}
+
+SUMMARY:
+- Total positions: {summary['total_positions']} ({summary['long_positions']} long, {summary['short_positions']} short, {summary['hedged_positions']} hedged)
+- Capital at entry: ₹{summary['capital_at_entry']:,.0f}
+- Current value (MTM): ₹{summary['current_value']:,.0f}
+- Unrealized P&L: ₹{summary['total_unrealized_pnl']:,.0f} ({summary['total_unrealized_pct']:+.1f}%)
+- Direction skew: {skew} (long {by_direction.get('long_pct', 0):.0f}% / short {by_direction.get('short_pct', 0):.0f}%)
+- Top symbol concentration: {top_sym} ({top_sym_pct:.0f}%)
+- Top sector concentration: {top_sec} ({top_sec_pct:.0f}%)
+
+ALGORITHMIC HEDGE CANDIDATES:
+{cand_str}
+
+YOUR TASK:
+1. Write a 2-3 paragraph book overview identifying the 2-3 PRIORITY risks (most pressing first). Be specific — name positions, percentages, sectors.
+2. Rank the algorithmic candidates by priority (1 = most important to act on). Not all candidates need to be top-ranked — pick the 3-4 most impactful given THIS book.
+3. For each candidate you rank, write a 1-2 sentence "why this hedge here" rationale that ties it to the specific risk in this book.
+4. Conclude with 1 paragraph of "general advice" about overall hedge strategy (e.g., "Hedge only what you can't afford to lose" or "Don't over-hedge — the cost adds up").
+
+Constraints:
+- DO NOT invent strikes, premiums, or lot sizes — use only what's in the algorithmic candidates above.
+- DO NOT recommend products not in the candidates (no exotic options, no global cross-asset).
+- DO write in plain, direct English. Avoid jargon where simpler words work.
+- DO NOT say "consult a financial advisor" — the user knows. Be concrete.
+- Output MUST be valid JSON with this exact structure:
+{{
+  "narrative": "<2-3 paragraph book overview>",
+  "rankings": [
+    {{"candidate_index": <1-based index into algorithmic candidates>, "priority": <1-N>, "rationale": "<1-2 sentence why>"}},
+    ...
+  ],
+  "general_advice": "<1 paragraph closing thoughts>"
+}}
+
+Return ONLY the JSON, no markdown fences, no preamble."""
+
+
+@app.route("/api/hedge-suggestions", methods=["POST"])
+@limiter.limit(AI_RATE_LIMIT)
+def hedge_suggestions():
+    """
+    Generate hedge suggestions for the current book.
+    Takes risk-dashboard data as POST body to avoid duplicate Yahoo fetches.
+    """
+    if not anthropic_client:
+        return jsonify({"error": "AI service not configured"}), 500
+
+    try:
+        body = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    positions     = body.get("positions") or []
+    summary       = body.get("summary") or {}
+    concentration = body.get("concentration") or {}
+    warnings_list = body.get("warnings") or []
+
+    if not positions:
+        return jsonify({
+            "narrative":      "No open positions to hedge. Once you have open trades, this section will analyze them and suggest specific hedging plays.",
+            "hedges":         [],
+            "general_advice": "Hedging starts with risk awareness. Use the Risk Dashboard daily; hedge only when concentration or skew warnings appear.",
+        }), 200
+
+    # ----- Algorithmic layer -----
+    candidates = _build_algo_hedge_candidates(positions, summary, concentration, warnings_list)
+
+    if not candidates:
+        return jsonify({
+            "narrative":      "Your current book doesn't show meaningful concentration, skew, or stress-risk warnings. No specific hedges are warranted right now.",
+            "hedges":         [],
+            "general_advice": "Continue monitoring. Set up alerts on the Risk Dashboard for when concentration crosses 20% in a single name or 35% in a single sector — those are the moments to hedge.",
+        }), 200
+
+    # ----- AI layer: refine and rank -----
+    prompt = _build_hedge_ai_prompt(positions, summary, concentration, warnings_list, candidates)
+
+    try:
+        ai_resp = anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        ai_text = ai_resp.content[0].text.strip()
+        # Strip code fences if Claude included them
+        if ai_text.startswith("```"):
+            ai_text = ai_text.split("```")[1]
+            if ai_text.startswith("json"):
+                ai_text = ai_text[4:]
+            ai_text = ai_text.strip()
+        ai_data = json.loads(ai_text)
+    except Exception as e:
+        logger.exception("Hedge AI call failed: %s", e)
+        # Fall back: return algorithmic candidates without AI ranking
+        return jsonify({
+            "narrative":      "AI ranking unavailable — showing all algorithmic hedge candidates in default order. Review each based on which risk you find most pressing.",
+            "hedges":         [{**c, "priority": i + 1, "rationale": ""} for i, c in enumerate(candidates)],
+            "general_advice": "Pick at most 1-2 hedges to actually implement. Over-hedging burns capital on premiums and margin.",
+            "ai_error":       str(e),
+        }), 200
+
+    # Merge AI rankings into the candidates
+    rankings = {r["candidate_index"]: r for r in (ai_data.get("rankings") or [])}
+    hedges = []
+    for i, c in enumerate(candidates, 1):
+        rank = rankings.get(i, {})
+        hedges.append({
+            **c,
+            "priority":  rank.get("priority", 99),
+            "rationale": rank.get("rationale", ""),
+        })
+    # Sort by priority asc (top-priority first); drop low-priority unranked items
+    hedges = sorted(hedges, key=lambda h: h["priority"])
+
+    return jsonify({
+        "narrative":      ai_data.get("narrative", "").strip(),
+        "hedges":         hedges,
+        "general_advice": ai_data.get("general_advice", "").strip(),
+        "model":          ANTHROPIC_MODEL,
+    }), 200
+
+
+# ---------------------------------------------------------------------------
 # Price data + indicators
 # ---------------------------------------------------------------------------
 def _fetch_price_data(symbol: str) -> Optional[dict]:
