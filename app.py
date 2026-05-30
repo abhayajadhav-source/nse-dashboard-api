@@ -1142,6 +1142,166 @@ def hedge_suggestions():
 
 
 # ---------------------------------------------------------------------------
+# Kanban Trade Idea Pipeline
+# ---------------------------------------------------------------------------
+# Pre-trade idea tracking — 4 stages (watching → researching → setup_forming
+# → setup_confirmed). Cards persist in their own table (kanban_ideas).
+# When ready, a card is "promoted" to a journal entry (live trade) and the
+# kanban card is deleted (clean handoff).
+#
+# Stale cards (no stage change in 30 days) auto-archive on every list call,
+# keeping the active view focused on real opportunities.
+# ---------------------------------------------------------------------------
+
+@app.route("/api/kanban", methods=["GET"])
+@limiter.limit(READ_RATE_LIMIT)
+def list_kanban_ideas():
+    """Return all non-archived kanban ideas, ordered by stage then position."""
+    try:
+        import kanban_store
+    except Exception as e:
+        logger.exception("Kanban list: kanban_store unavailable")
+        return jsonify({"error": f"Kanban module unavailable: {e}"}), 500
+
+    include_archived = request.args.get("include_archived", "").lower() == "true"
+    try:
+        ideas = kanban_store.list_ideas(include_archived=include_archived, limit=300)
+    except Exception as e:
+        logger.exception("Kanban list failed")
+        return jsonify({"error": f"Failed to list ideas: {e}"}), 500
+
+    # Group by stage for easier frontend rendering
+    by_stage = {s: [] for s in ["watching", "researching", "setup_forming", "setup_confirmed"]}
+    archived = []
+    for idea in ideas:
+        if idea.get("archived"):
+            archived.append(idea)
+        else:
+            by_stage.setdefault(idea["stage"], []).append(idea)
+
+    return jsonify({
+        "by_stage": by_stage,
+        "archived": archived if include_archived else [],
+        "counts": {s: len(by_stage[s]) for s in by_stage},
+    }), 200
+
+
+@app.route("/api/kanban/<int:idea_id>", methods=["GET"])
+@limiter.limit(READ_RATE_LIMIT)
+def get_kanban_idea(idea_id):
+    """Fetch a single kanban idea."""
+    try:
+        import kanban_store
+    except Exception as e:
+        return jsonify({"error": f"Kanban module unavailable: {e}"}), 500
+
+    idea = kanban_store.get_idea(idea_id)
+    if idea is None:
+        return jsonify({"error": "Idea not found"}), 404
+    return jsonify(idea), 200
+
+
+@app.route("/api/kanban", methods=["POST"])
+@limiter.limit(READ_RATE_LIMIT)
+def create_kanban_idea():
+    """Create a new kanban idea."""
+    try:
+        import kanban_store
+    except Exception as e:
+        return jsonify({"error": f"Kanban module unavailable: {e}"}), 500
+
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    try:
+        idea = kanban_store.create_idea(payload)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("Kanban create failed")
+        return jsonify({"error": f"Failed to create idea: {e}"}), 500
+
+    return jsonify(idea), 201
+
+
+@app.route("/api/kanban/<int:idea_id>", methods=["PATCH"])
+@limiter.limit(READ_RATE_LIMIT)
+def update_kanban_idea(idea_id):
+    """Update a kanban idea (any field, including stage)."""
+    try:
+        import kanban_store
+    except Exception as e:
+        return jsonify({"error": f"Kanban module unavailable: {e}"}), 500
+
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    try:
+        idea = kanban_store.update_idea(idea_id, payload)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("Kanban update failed for id=%s", idea_id)
+        return jsonify({"error": f"Failed to update idea: {e}"}), 500
+
+    if idea is None:
+        return jsonify({"error": "Idea not found"}), 404
+    return jsonify(idea), 200
+
+
+@app.route("/api/kanban/<int:idea_id>", methods=["DELETE"])
+@limiter.limit(READ_RATE_LIMIT)
+def delete_kanban_idea(idea_id):
+    """Hard-delete a kanban idea."""
+    try:
+        import kanban_store
+    except Exception as e:
+        return jsonify({"error": f"Kanban module unavailable: {e}"}), 500
+
+    try:
+        deleted = kanban_store.delete_idea(idea_id)
+    except Exception as e:
+        logger.exception("Kanban delete failed for id=%s", idea_id)
+        return jsonify({"error": f"Failed to delete idea: {e}"}), 500
+
+    if not deleted:
+        return jsonify({"error": "Idea not found"}), 404
+    return jsonify({"ok": True, "id": idea_id}), 200
+
+
+@app.route("/api/kanban/<int:idea_id>/promote", methods=["POST"])
+@limiter.limit(READ_RATE_LIMIT)
+def promote_kanban_idea(idea_id):
+    """Promote a kanban idea to a live journal trade. Deletes the kanban card."""
+    try:
+        import kanban_store
+    except Exception as e:
+        return jsonify({"error": f"Kanban module unavailable: {e}"}), 500
+
+    try:
+        journal_row = kanban_store.promote_idea(idea_id)
+    except ValueError as e:
+        # Validation errors (missing fields) — return as 400
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("Kanban promote failed for id=%s", idea_id)
+        return jsonify({"error": f"Failed to promote idea: {e}"}), 500
+
+    if journal_row is None:
+        return jsonify({"error": "Idea not found"}), 404
+
+    return jsonify({
+        "ok": True,
+        "journal_trade": journal_row,
+        "message": f"Idea promoted to live trade #{journal_row.get('id')}",
+    }), 200
+
+
+# ---------------------------------------------------------------------------
 # Price data + indicators
 # ---------------------------------------------------------------------------
 def _fetch_price_data(symbol: str) -> Optional[dict]:
