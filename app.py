@@ -1647,7 +1647,163 @@ def _fetch_news(symbol: str, max_items: int = 6) -> list:
         if len(items) >= max_items:
             break
 
+    # Classify each item as MATERIAL or NOISE for trading decisions.
+    # Rules-based first (fast/free); AI-backed only for ambiguous items.
+    items = _classify_news_relevance(items, symbol)
+
     return items
+
+
+# ---------------------------------------------------------------------------
+# News relevance classifier
+# ---------------------------------------------------------------------------
+# Tags each news item with relevance ("material" | "noise") for trading.
+# Two-pass strategy:
+#   1. Rules-based keyword classifier handles ~70-80% of headlines instantly
+#   2. Remaining ambiguous headlines go to a single batched AI call
+# Each item also gets `relevance_source` ("rule" | "ai") for transparency.
+# ---------------------------------------------------------------------------
+
+# MATERIAL keywords — strongly suggest a tradable/actionable news item.
+# Includes: financial results, corporate actions, regulatory, M&A,
+# management changes, large stake transactions, dividends/buybacks.
+_MATERIAL_PATTERNS = [
+    # Financial results
+    r"\b(q[1-4]|quarterly|annual)\s+(results?|earnings?)\b",
+    r"\b(beats?|missed?|exceed(s|ed)?)\s+(estimates?|expectations?|consensus)\b",
+    r"\b(profit|loss|revenue|ebitda|net income)\s+(rises?|falls?|grows?|drops?|jumps?|up|down|surges?)\b",
+    r"\bguidance\s+(raised?|cut|revised?|lowered?)\b",
+    # Corporate actions
+    r"\b(buyback|bonus|stock split|share split|rights issue|dividend)\b",
+    r"\b(merger|acquisition|takeover|m&a|stake (sale|purchase|buy))\b",
+    r"\b(spin[\s-]?off|demerger|delisting|ipo)\b",
+    # Regulatory / legal
+    r"\b(rbi|sebi|cci|nclt|sat|cbi|ed|enforcement directorate)\b",
+    r"\b(regulatory|approval|license|sanction|fine|penalty|probe|investigation|raid|fraud|lawsuit)\b",
+    # Management / governance
+    r"\b(ceo|cfo|md|managing director|chairman)\s+(resigns?|steps? down|appointed?|exits?|leaves?|joined?)\b",
+    r"\b(resignation|appointment|reshuffle)\b",
+    # Large transactions / ownership
+    r"\b(block deal|bulk deal|promoter (buy|sell|stake)|insider)\b",
+    r"\b(stake of \d+|acquir(es?|ed) \d+|sells? \d+%)\b",
+    # Specific event types
+    r"\b(order|contract)\s+(win|award|secured|received|worth)\b",
+    r"\bcredit rating\s+(upgrade|downgrade|cut|raised?)" + r"[ds]?\b",
+    r"\b(plant|factory)\s+(shut|closure|fire|accident|inaugurat)",
+    r"\b(strike|lockout|union)\b",
+]
+
+# NOISE keywords — speculative, repetitive, or low-signal items.
+_NOISE_PATTERNS = [
+    # Analyst chatter (not the action itself)
+    r"\b(target price|price target|broker(age)?\s+(call|view|report))\b",
+    r"\b(buy|sell|hold|accumulate|reduce|outperform|underperform)\s+(rating|call|recommendation)\b",
+    r"\banalyst[s]?\s+(say|predict|expect|see|believe|target)\b",
+    # Generic market noise
+    r"\b(stocks?\s+to\s+(watch|buy|sell)|top\s+(stock|pick)s?)\b",
+    r"\b(rumor|speculation|reported(ly)?|may|could|might|likely to)\b",
+    r"\b(intraday|today's call|chart|technical|support|resistance)\b",
+    # Sector/index chatter without specific action
+    r"\b(nifty|sensex|market|index)\s+(opens?|closes?|gains?|loses?|hits?)\b",
+    r"\b(rally|correction|crash|surge|drop)\s+(in|on)\s+(nifty|sensex|market)\b",
+]
+
+
+def _rules_classify_news_item(title: str, source: str) -> str:
+    """
+    Returns "material", "noise", or "ambiguous" based on keyword patterns.
+    Uses re.IGNORECASE. Material wins ties (rare but possible).
+    """
+    if not title:
+        return "ambiguous"
+    text = title.lower()
+
+    # Check material first
+    for pattern in _MATERIAL_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "material"
+    # Check noise
+    for pattern in _NOISE_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return "noise"
+    return "ambiguous"
+
+
+def _classify_news_relevance(items: list, symbol: str) -> list:
+    """
+    Tag each news item with `relevance` and `relevance_source`.
+    First pass: rules-based (fast). Second pass: batch AI for ambiguous items.
+    Failures are silent — items default to relevance="material" so users
+    don't lose news to a misfiring classifier.
+    """
+    if not items:
+        return items
+
+    # Pass 1: rules-based
+    ambiguous_indexes = []
+    for i, item in enumerate(items):
+        verdict = _rules_classify_news_item(item.get("title", ""), item.get("source", ""))
+        if verdict == "ambiguous":
+            ambiguous_indexes.append(i)
+            item["relevance"] = "material"   # default; will be overwritten by AI if it runs
+            item["relevance_source"] = "default"
+        else:
+            item["relevance"] = verdict
+            item["relevance_source"] = "rule"
+
+    # Pass 2: AI for ambiguous items (only if any exist and Anthropic client is available)
+    if ambiguous_indexes and anthropic_client:
+        ambiguous_titles = [
+            f"{i + 1}. {items[idx]['title']}"
+            for i, idx in enumerate(ambiguous_indexes)
+        ]
+        prompt = f"""Classify each headline as MATERIAL or NOISE for an Indian F&O retail trader.
+
+MATERIAL = news that could affect the stock price meaningfully or change a trading thesis. Examples: earnings results, M&A, regulatory action, management changes, large transactions, contract wins, credit rating changes.
+
+NOISE = analyst chatter, target price changes, generic stock-pick lists, broad market commentary, speculation without a concrete action.
+
+Stock under analysis: {symbol}
+
+Headlines to classify:
+{chr(10).join(ambiguous_titles)}
+
+Return ONLY a JSON array with one verdict per headline in order, like:
+["material", "noise", "material", ...]
+
+No preamble, no markdown, no explanations. Just the JSON array."""
+
+        try:
+            resp = anthropic_client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            ai_text = resp.content[0].text.strip()
+            if ai_text.startswith("```"):
+                ai_text = ai_text.split("```")[1]
+                if ai_text.startswith("json"):
+                    ai_text = ai_text[4:]
+                ai_text = ai_text.strip()
+            verdicts = json.loads(ai_text)
+            if isinstance(verdicts, list) and len(verdicts) == len(ambiguous_indexes):
+                for i, idx in enumerate(ambiguous_indexes):
+                    v = str(verdicts[i]).lower().strip()
+                    if v in ("material", "noise"):
+                        items[idx]["relevance"] = v
+                        items[idx]["relevance_source"] = "ai"
+            else:
+                logger.warning("News AI classifier returned unexpected length: %d vs %d expected",
+                               len(verdicts) if isinstance(verdicts, list) else -1,
+                               len(ambiguous_indexes))
+        except Exception as e:
+            logger.warning("News AI classifier failed (non-fatal): %s", e)
+            # Items keep their "default" relevance (material) — better to over-show
+            # than to hide potentially-relevant news
+
+    return items
+
+
 
 
 # ---------------------------------------------------------------------------
