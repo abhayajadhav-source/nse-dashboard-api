@@ -2274,14 +2274,17 @@ def get_patterns(symbol):
 @limiter.limit(READ_RATE_LIMIT)
 def scan_patterns():
     """
-    Scan F&O symbols (sourced from the latest momentum snapshot, which
-    is cron-fed) for active patterns on the DAILY timeframe.
+    Scan NSE stock universe for active patterns on the DAILY timeframe.
 
-    Pattern detection is cache-backed, so subsequent scans within 6 hours
-    are fast. The first scan may take 30-60 seconds depending on universe
-    size.
+    Universe priority:
+      1. momentum_snapshot table (cron-fed list of "active" stocks)
+         — uses just SELECT symbol, no column-name assumptions
+      2. stock_list.get_all_symbols() — the NIFTY 200 universe
 
-    Optional query param: ?limit=N to cap the universe (default: 50).
+    Pattern detection is cache-backed (6h TTL for daily), so subsequent
+    scans within 6 hours are fast. The first scan may take 30-60 seconds.
+
+    Optional query param: ?limit=N (default 50, capped at 150).
     """
     try:
         limit = int(request.args.get("limit", 50))
@@ -2289,71 +2292,82 @@ def scan_patterns():
         limit = 50
     limit = max(5, min(limit, 150))
 
-    # Source the universe from the momentum snapshot — these are stocks
-    # already known to be active. Cleaner than maintaining a separate
-    # F&O universe list. Falls back to stock_list module if unavailable.
+    # Get the universe to scan
     universe = []
-    try:
-        with _db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """SELECT DISTINCT symbol FROM momentum_snapshot
-                       ORDER BY pct_change DESC NULLS LAST LIMIT %s""",
-                    (limit,))
-                universe = [r[0] for r in cur.fetchall()]
-    except Exception as e:
-        logger.warning("Scan: momentum_snapshot unavailable, using fallback: %s", e)
+
+    # Try momentum_snapshot first — use defensive query that doesn't
+    # assume specific column names beyond `symbol`
+    if DATABASE_URL:
         try:
-            from stock_list import FNO_STOCKS
-            universe = FNO_STOCKS[:limit]
-        except Exception:
-            return jsonify({"error": "Universe unavailable"}), 500
+            with _conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT DISTINCT symbol FROM momentum_snapshot LIMIT %s",
+                        (limit,))
+                    universe = [r[0] for r in cur.fetchall() if r[0]]
+            logger.info("Scan: sourced %d symbols from momentum_snapshot", len(universe))
+        except Exception as e:
+            logger.warning("Scan: momentum_snapshot unavailable (%s) — using stock_list", e)
+
+    # Fallback: stock_list — the NIFTY 200 universe
+    if not universe:
+        try:
+            from stock_list import get_all_symbols
+            universe = get_all_symbols()[:limit]
+            logger.info("Scan: sourced %d symbols from stock_list", len(universe))
+        except Exception as e:
+            logger.exception("Scan: stock_list also failed: %s", e)
+            return jsonify({
+                "error":    "Universe unavailable — both momentum_snapshot and stock_list failed",
+                "scanned":  0,
+                "results":  [],
+            }), 500
 
     if not universe:
         return jsonify({"symbols": [], "results": [], "scanned": 0}), 200
 
     # Run pattern detection on each symbol (daily only — intraday too slow)
     results = []
+    failures = 0
     for sym in universe:
         try:
             patterns = _detect_patterns_cached(sym, "daily")
+            if patterns.get("error"):
+                failures += 1
+                continue
             total = (len(patterns.get("candlesticks", [])) +
                      len(patterns.get("chart_patterns", [])))
             if total == 0:
                 continue   # Skip symbols with no patterns
-            # Compress to summary record for the scanner table
             results.append({
-                "symbol":         sym,
-                "candlestick_count": len(patterns.get("candlesticks", [])),
+                "symbol":              sym,
+                "candlestick_count":   len(patterns.get("candlesticks", [])),
                 "chart_pattern_count": len(patterns.get("chart_patterns", [])),
-                "bullish_count":  patterns["summary"]["bullish_count"],
-                "bearish_count":  patterns["summary"]["bearish_count"],
-                "formed_count":   patterns["summary"]["formed_count"],
-                "forming_count":  patterns["summary"]["forming_count"],
-                # Include the top-3 most recent patterns for the table
+                "bullish_count":       patterns["summary"]["bullish_count"],
+                "bearish_count":       patterns["summary"]["bearish_count"],
+                "formed_count":        patterns["summary"]["formed_count"],
+                "forming_count":       patterns["summary"]["forming_count"],
                 "patterns": (
                     patterns.get("candlesticks", []) +
                     patterns.get("chart_patterns", [])
                 )[:3],
             })
         except Exception as e:
+            failures += 1
             logger.warning("Pattern scan failed for %s: %s", sym, e)
 
-    # Sort: most patterns first, then most bullish-skewed
-    results.sort(key=lambda r: (r["formed_count"], abs(r["bullish_count"] - r["bearish_count"])),
+    # Sort: most formed patterns first, then by direction conviction
+    results.sort(key=lambda r: (r["formed_count"],
+                                 abs(r["bullish_count"] - r["bearish_count"])),
                   reverse=True)
 
     return jsonify({
-        "scanned":     len(universe),
+        "scanned":       len(universe),
         "with_patterns": len(results),
-        "results":     results,
-        "fetched_at":  datetime.utcnow().isoformat() + "Z",
+        "failures":      failures,
+        "results":       results,
+        "fetched_at":    datetime.utcnow().isoformat() + "Z",
     }), 200
-
-
-def _db_conn():
-    """Thin wrapper to get a DB connection (used by scan endpoint)."""
-    return psycopg2.connect(DATABASE_URL)
 
 
 # ---------------------------------------------------------------------------
