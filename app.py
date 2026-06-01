@@ -2317,17 +2317,19 @@ def scan_patterns():
                 momentum_error = f"{type(e).__name__}: {str(e)[:200]}"
                 logger.warning("Scan: momentum_snapshot unavailable: %s", momentum_error)
 
-        # Fallback: stock_list
+        # Fallback: NSE_LOT_SIZES — the ~50 active F&O stocks defined
+        # in this same file (no external module dependency)
         stock_list_error = None
         if not universe:
             try:
-                from stock_list import get_all_symbols
-                all_syms = get_all_symbols()
-                universe = list(all_syms)[:limit]
-                universe_source = "stock_list"
+                # NSE_LOT_SIZES is defined later in this module; reference
+                # via globals() to avoid forward-ref issues if rearranged
+                fno_universe = list(NSE_LOT_SIZES.keys())
+                universe = fno_universe[:limit]
+                universe_source = "NSE_LOT_SIZES"
             except Exception as e:
                 stock_list_error = f"{type(e).__name__}: {str(e)[:200]}"
-                logger.exception("Scan: stock_list import failed: %s", stock_list_error)
+                logger.exception("Scan: NSE_LOT_SIZES fallback failed: %s", stock_list_error)
 
         # Diagnostic mode: short-circuit before doing any pattern work
         if diag_mode or not universe:
