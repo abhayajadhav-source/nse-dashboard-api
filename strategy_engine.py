@@ -1439,10 +1439,18 @@ def build_all_strategies(ctx: StrategyContext) -> List[StrategyResult]:
 # ---------------------------------------------------------------------------
 # Outlook derivation (from existing data)
 # ---------------------------------------------------------------------------
-def derive_outlook(price_data: dict, options_data, analyst_data: dict) -> dict:
+def derive_outlook(price_data: dict, options_data, analyst_data: dict,
+                   iv_context: Optional[dict] = None) -> dict:
     """
     Convert technical/options/analyst signals into outlook flags used by
     the strategy engine. Returns dict with direction, conviction, iv_regime.
+
+    iv_context (added 2026): optional dict from _build_iv_context() in app.py
+    containing real ATM IV and India VIX percentile. When provided, takes
+    PRIORITY over the legacy PCR-based IV regime proxy.
+
+    Expected iv_context shape:
+      {"atm_iv": 0.25, "vix_percentile": 65.0, "vix_regime": "elevated", ...}
     """
     # ---- Direction ----
     bullish_signals = 0
@@ -1487,13 +1495,27 @@ def derive_outlook(price_data: dict, options_data, analyst_data: dict) -> dict:
     elif dominance >= 0.3:  conviction = 'moderate'
     else:                    conviction = 'weak'
 
-    # ---- IV Regime (proxy from options data) ----
-    # We don't have direct IV; use PCR + composite as proxy
+    # ---- IV Regime ----
+    # Tier 1: use real IV context if provided (VIX percentile is the most
+    # reliable signal for "are options expensive right now")
     iv_regime = 'normal'
-    if options_data:
+    if iv_context and iv_context.get("vix_percentile") is not None:
+        pct = iv_context["vix_percentile"]
+        if pct >= 70:   iv_regime = 'high'   # premiums expensive
+        elif pct <= 30: iv_regime = 'low'    # premiums cheap
+        else:            iv_regime = 'normal'
+    elif iv_context and iv_context.get("atm_iv") is not None:
+        # Fallback: per-stock ATM IV without historical context.
+        # Use absolute thresholds calibrated to Indian single-stock IVs
+        # (typically 15-35% normal, >40% elevated, <15% unusually low)
+        atm_iv = iv_context["atm_iv"]
+        if atm_iv >= 0.40:   iv_regime = 'high'
+        elif atm_iv <= 0.15: iv_regime = 'low'
+        else:                 iv_regime = 'normal'
+    elif options_data:
+        # Tier 3: legacy PCR proxy (kept for back-compat when iv_context
+        # isn't available — e.g., if VIX fetch failed and no ATM IV computed)
         pcr = getattr(options_data, 'pcr_oi', 1.0)
-        # PCR far from 1.0 in either direction often coincides with elevated IV
-        # And high composite strength suggests big positioning = often high IV
         composite_strength = getattr(options_data, 'composite_strength', 0)
         if pcr > 1.3 or pcr < 0.7 or composite_strength >= 4:
             iv_regime = 'high'
