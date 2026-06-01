@@ -336,6 +336,137 @@ def get_snapshot():
 _MARKET_CONTEXT_CACHE = {"data": None, "expires_at": 0}
 _MARKET_CONTEXT_TTL_SECONDS = 60   # 60-second in-memory cache
 
+# IV percentile via India VIX — 90-day history cache. Refreshed every 30 min
+# (intraday VIX moves are usually <1% of percentile rank, so 30min is fine).
+_VIX_PERCENTILE_CACHE = {"data": None, "expires_at": 0}
+_VIX_PERCENTILE_TTL_SECONDS = 30 * 60   # 30 minutes
+
+
+def _compute_vix_percentile_90d() -> Optional[dict]:
+    """
+    Fetch 90 days of India VIX history from Yahoo, compute today's percentile
+    rank, and return a context dict for use as an IV proxy when per-stock
+    IV history isn't available.
+
+    Returns:
+      {
+        "vix":            current VIX level (float),
+        "percentile_90d": 0-100 where today's VIX ranks vs last 90 trading days,
+        "regime":         "low" | "normal" | "elevated" | "spiked",
+        "fetched_at":     ISO timestamp,
+      }
+      or None if Yahoo fetch fails.
+
+    Cached for 30 minutes via _VIX_PERCENTILE_CACHE.
+    """
+    import time
+    now = time.time()
+    if _VIX_PERCENTILE_CACHE["data"] and now < _VIX_PERCENTILE_CACHE["expires_at"]:
+        return _VIX_PERCENTILE_CACHE["data"]
+
+    try:
+        t = yf.Ticker("^INDIAVIX")
+        # 4 months = ~85 trading days, safe buffer for 90-day percentile
+        hist = t.history(period="4mo", interval="1d")
+        if hist.empty or len(hist) < 30:
+            logger.warning("VIX percentile: insufficient history (%d rows)", len(hist))
+            return None
+
+        closes = hist["Close"].dropna().tolist()
+        if not closes:
+            return None
+
+        current_vix = float(closes[-1])
+        # Percentile rank: % of historical values strictly less than current
+        # (so today's value at the 50th percentile = median of history)
+        below_count = sum(1 for v in closes if v < current_vix)
+        percentile  = (below_count / len(closes)) * 100.0
+
+        # Regime classification (Indian-calibrated — VIX in 12-25 is normal)
+        if   current_vix < 12: regime = "low"
+        elif current_vix < 18: regime = "normal"
+        elif current_vix < 25: regime = "elevated"
+        else:                  regime = "spiked"
+
+        out = {
+            "vix":            round(current_vix, 2),
+            "percentile_90d": round(percentile, 1),
+            "regime":         regime,
+            "fetched_at":     datetime.utcnow().isoformat() + "Z",
+        }
+        _VIX_PERCENTILE_CACHE["data"] = out
+        _VIX_PERCENTILE_CACHE["expires_at"] = now + _VIX_PERCENTILE_TTL_SECONDS
+        return out
+    except Exception as e:
+        logger.warning("VIX percentile computation failed: %s", e)
+        return None
+
+
+def _build_iv_context(options_data) -> Optional[dict]:
+    """
+    Build a structured IV context for downstream consumers (Analyze tab,
+    Strategy Advisor, Trade Plan, Hedge Suggestions).
+
+    Combines per-stock ATM IV (from options chain) with India VIX
+    percentile as a market-wide regime proxy. Returns None if no usable
+    data is available.
+
+    Output:
+      {
+        "atm_iv":            decimal (0.25 = 25%) or None,
+        "atm_iv_pct":        25.0 style display value or None,
+        "vix_level":         float,
+        "vix_percentile":    0-100,
+        "vix_regime":        "low" / "normal" / "elevated" / "spiked",
+        "iv_label":          human-readable label combining both signals,
+        "trader_guidance":   one-line directional take for trade planning,
+      }
+    """
+    if options_data is None:
+        return None
+
+    vix_ctx = _compute_vix_percentile_90d()
+    atm_iv  = getattr(options_data, "atm_iv", None)
+
+    if atm_iv is None and vix_ctx is None:
+        return None
+
+    out = {
+        "atm_iv":         atm_iv,
+        "atm_iv_pct":     round(atm_iv * 100, 1) if atm_iv else None,
+        "vix_level":      vix_ctx["vix"] if vix_ctx else None,
+        "vix_percentile": vix_ctx["percentile_90d"] if vix_ctx else None,
+        "vix_regime":     vix_ctx["regime"] if vix_ctx else "unknown",
+    }
+
+    # Combined label: prefer per-stock ATM IV if available, else VIX regime
+    if atm_iv is not None and vix_ctx is not None:
+        # Both signals — VIX percentile is the comparison anchor
+        if vix_ctx["percentile_90d"] >= 70:
+            out["iv_label"] = f"IV elevated (ATM {out['atm_iv_pct']:.0f}%, VIX P{vix_ctx['percentile_90d']:.0f})"
+            out["trader_guidance"] = "Premiums rich; favor short-premium strategies (credit spreads, iron condors). Avoid debit spreads / long options."
+        elif vix_ctx["percentile_90d"] <= 30:
+            out["iv_label"] = f"IV cheap (ATM {out['atm_iv_pct']:.0f}%, VIX P{vix_ctx['percentile_90d']:.0f})"
+            out["trader_guidance"] = "Premiums cheap; favor long-premium strategies (long options, debit spreads). Avoid short premium."
+        else:
+            out["iv_label"] = f"IV normal (ATM {out['atm_iv_pct']:.0f}%, VIX P{vix_ctx['percentile_90d']:.0f})"
+            out["trader_guidance"] = "Premiums fairly priced; strategy selection should rest on directional view rather than IV edge."
+    elif vix_ctx is not None:
+        # Only VIX
+        out["iv_label"] = f"VIX {vix_ctx['vix']:.1f} ({vix_ctx['regime']}, P{vix_ctx['percentile_90d']:.0f})"
+        if vix_ctx["percentile_90d"] >= 70:
+            out["trader_guidance"] = "Market-wide IV elevated; reduce options buying, consider premium-selling strategies."
+        elif vix_ctx["percentile_90d"] <= 30:
+            out["trader_guidance"] = "Market-wide IV cheap; premium-buying strategies more favorable."
+        else:
+            out["trader_guidance"] = "Market-wide IV in normal band; no IV-driven preference."
+    else:
+        # Only per-stock IV (no VIX context available)
+        out["iv_label"] = f"ATM IV {out['atm_iv_pct']:.0f}%"
+        out["trader_guidance"] = "No historical VIX comparison available; evaluate strategy on direction alone."
+
+    return out
+
 
 @app.route("/api/market-context")
 def get_market_context():
@@ -1016,6 +1147,31 @@ def _build_hedge_ai_prompt(positions: list, summary: dict, concentration: dict,
     top_sec = by_sector[0]["sector"] if by_sector else "—"
     top_sec_pct = by_sector[0]["pct_of_book"] if by_sector else 0
 
+    # ---- IV regime context — informs whether to favor premium-buy vs premium-sell hedges ----
+    # Uses India VIX percentile (market-wide proxy). When IV is rich, premium-
+    # selling hedges (covered calls, collars with short call leg) become more
+    # attractive; when IV is cheap, protective puts get better value.
+    iv_block = ""
+    vix_ctx = _compute_vix_percentile_90d()
+    if vix_ctx:
+        iv_block = (
+            f"\nIV REGIME (market-wide via India VIX):\n"
+            f"- VIX level: {vix_ctx['vix']:.1f} (P{vix_ctx['percentile_90d']:.0f} of last 90d, regime: {vix_ctx['regime']})\n"
+        )
+        if vix_ctx["percentile_90d"] >= 70:
+            iv_block += (
+                f"- IV is ELEVATED → premium-buying hedges (long puts) are expensive. "
+                f"Prefer premium-SELLING hedges (covered calls, collars where short-call leg dominates). "
+                f"If recommending a protective put, note the IV-cost trade-off explicitly.\n"
+            )
+        elif vix_ctx["percentile_90d"] <= 30:
+            iv_block += (
+                f"- IV is CHEAP → premium-buying hedges (protective puts) are good value. "
+                f"Avoid premium-selling hedges (collars, covered calls) — you'd be selling cheap premium.\n"
+            )
+        else:
+            iv_block += "- IV is in normal band → no strong IV-driven preference; pick hedges on direct-risk grounds.\n"
+
     return f"""You are a derivatives risk advisor for an Indian F&O retail trader. Review their book and the algorithmically-generated hedge candidates. Write a focused, practical hedge plan.
 
 CURRENT BOOK:
@@ -1029,7 +1185,7 @@ SUMMARY:
 - Direction skew: {skew} (long {by_direction.get('long_pct', 0):.0f}% / short {by_direction.get('short_pct', 0):.0f}%)
 - Top symbol concentration: {top_sym} ({top_sym_pct:.0f}%)
 - Top sector concentration: {top_sec} ({top_sec_pct:.0f}%)
-
+{iv_block}
 ALGORITHMIC HEDGE CANDIDATES:
 {cand_str}
 
@@ -2016,6 +2172,7 @@ def get_options():
         "symbol":           opts.symbol,
         "underlying_price": opts.underlying_price,
         "expiry_date":      opts.expiry_date,
+        "days_to_expiry":   opts.days_to_expiry,
         "pcr_oi":           round(opts.pcr_oi, 2),
         "pcr_volume":       round(opts.pcr_volume, 2),
         "max_pain":         round(opts.max_pain, 2),
@@ -2032,6 +2189,9 @@ def get_options():
         "composite_strength":     opts.composite_strength,
         "confirmations":          opts.confirmations,
         "top_strikes":            opts.top_strikes,
+        # IV / Greeks context (added 2026)
+        "atm_iv":                 opts.atm_iv,
+        "iv_context":             _build_iv_context(opts),
     }), 200
 
 
@@ -2079,6 +2239,7 @@ def analyze_stock():
         options_payload = {
             "symbol":              options.symbol,
             "expiry_date":         options.expiry_date,
+            "days_to_expiry":      options.days_to_expiry,
             "pcr_oi":              round(options.pcr_oi, 2),
             "pcr_volume":          round(options.pcr_volume, 2),
             "max_pain":            round(options.max_pain, 2),
@@ -2095,6 +2256,9 @@ def analyze_stock():
             "composite_strength":     options.composite_strength,
             "confirmations":          options.confirmations,
             "top_strikes":            options.top_strikes,
+            # IV / Greeks context (2026)
+            "atm_iv":                 options.atm_iv,
+            "iv_context":             _build_iv_context(options),
         }
 
     return jsonify({
@@ -2735,6 +2899,107 @@ GUARDRAILS
 """
 
 
+def _enrich_strategy_with_greeks(result, options_data, spot: float,
+                                  days_to_expiry: int) -> dict:
+    """
+    Take a StrategyResult and enrich its legs with per-leg Greeks +
+    add a strategy-level Greeks totals block. Returns a dict ready for JSON
+    serialization.
+
+    Greeks computation:
+      - For each leg with a strike + instrument (CALL/PUT), look up the
+        leg's IV in options_data.top_strikes by strike+side. If found,
+        use that IV. Otherwise fall back to ATM IV.
+      - Compute delta/gamma/theta/vega via black_scholes_greeks.
+      - Sign and scale by leg direction (BUY = +1, SELL = -1) and quantity
+        (lots × lot_size) when summing totals.
+
+    Stock legs (instrument='STOCK') contribute delta=±1.0 (per share), zero
+    other Greeks.
+    """
+    from greeks import black_scholes_greeks
+
+    base = result.to_dict()
+    if not options_data or not base.get("legs"):
+        return base
+
+    # Build strike → IV lookup from the option chain (both CE + PE sides)
+    iv_lookup = {}
+    for s in (getattr(options_data, "top_strikes", []) or []):
+        if s.get("call_iv") is not None:
+            iv_lookup[(s["strike"], "CALL")] = s["call_iv"]
+        if s.get("put_iv") is not None:
+            iv_lookup[(s["strike"], "PUT")] = s["put_iv"]
+
+    atm_iv = getattr(options_data, "atm_iv", None)
+    lot_size = base.get("lot_size", 1)
+
+    # Strategy totals (PER UNDERLYING — i.e. multiply by lot_size × lots to
+    # get position-level Greeks)
+    total_delta = 0.0
+    total_gamma = 0.0
+    total_theta = 0.0
+    total_vega  = 0.0
+
+    enriched_legs = []
+    for leg in base["legs"]:
+        enriched = dict(leg)
+        instrument = leg.get("instrument", "").upper()
+        action     = leg.get("action", "").upper()
+        strike     = leg.get("strike")
+        quantity   = leg.get("quantity", 0) or 0
+        sign = 1.0 if action == "BUY" else -1.0
+
+        if instrument == "STOCK":
+            # Stock leg: delta = ±1 per share, no other Greeks
+            enriched["delta"] = round(sign * 1.0, 4)
+            enriched["gamma"] = 0.0
+            enriched["theta"] = 0.0
+            enriched["vega"]  = 0.0
+            # Stock quantity in legs is typically expressed as shares directly
+            # (not lots). Use it as-is for totals.
+            total_delta += sign * quantity
+        elif instrument in ("CALL", "PUT") and strike is not None and days_to_expiry > 0:
+            opt_type = "call" if instrument == "CALL" else "put"
+            # Pick IV: leg-specific from chain, else ATM IV fallback
+            iv = iv_lookup.get((strike, instrument))
+            if iv is None or iv <= 0:
+                iv = atm_iv
+            if iv and iv > 0:
+                g = black_scholes_greeks(spot, strike, days_to_expiry, iv, opt_type)
+                enriched["delta"] = round(sign * g["delta"], 4)
+                enriched["gamma"] = round(sign * g["gamma"], 6)
+                enriched["theta"] = round(sign * g["theta"], 4)
+                enriched["vega"]  = round(sign * g["vega"], 4)
+                enriched["iv"]    = round(iv, 4)
+                # Totals: each lot moves N=lot_size shares of underlying
+                multiplier = quantity * lot_size
+                total_delta += sign * g["delta"] * multiplier
+                total_gamma += sign * g["gamma"] * multiplier
+                total_theta += sign * g["theta"] * multiplier
+                total_vega  += sign * g["vega"]  * multiplier
+            else:
+                # No IV available — leave Greeks empty
+                enriched["delta"] = None
+                enriched["gamma"] = None
+                enriched["theta"] = None
+                enriched["vega"]  = None
+                enriched["iv"]    = None
+
+        enriched_legs.append(enriched)
+
+    base["legs"] = enriched_legs
+    base["greeks_totals"] = {
+        "delta": round(total_delta, 2),
+        "gamma": round(total_gamma, 4),
+        "theta": round(total_theta, 2),
+        "vega":  round(total_vega,  2),
+        "note":  "Position-level Greeks (sum of legs × lots × lot_size). "
+                 "Delta shown in shares of underlying.",
+    }
+    return base
+
+
 @app.route("/api/strategy", methods=["POST"])
 @limiter.limit(AI_RATE_LIMIT)
 def get_strategy():
@@ -2808,7 +3073,8 @@ def get_strategy():
             )
         }), 500
 
-    outlook = derive_outlook(price_data, options_data, ratings)
+    outlook = derive_outlook(price_data, options_data, ratings,
+                              iv_context=_build_iv_context(options_data))
 
     try:
         from datetime import datetime as dt
@@ -2856,6 +3122,14 @@ def get_strategy():
         logger.exception("Strategy AI call failed: %s", e)
         return jsonify({"error": f"AI strategy analysis failed: {str(e)}"}), 500
 
+    # Enrich legs with Greeks and compute strategy-level totals
+    top_pick_dict = _enrich_strategy_with_greeks(top_pick, options_data, spot,
+                                                  ctx.days_to_expiry)
+    alternatives_dicts = [
+        _enrich_strategy_with_greeks(a, options_data, spot, ctx.days_to_expiry)
+        for a in alternatives
+    ]
+
     return jsonify({
         "symbol": symbol,
         "analyzed_at": datetime.utcnow().isoformat() + "Z",
@@ -2864,8 +3138,9 @@ def get_strategy():
         "days_to_expiry": days_to_expiry,
         "expiry_date": options_data.expiry_date,
         "outlook": outlook,
-        "top_pick": top_pick.to_dict(),
-        "alternatives": [a.to_dict() for a in alternatives],
+        "iv_context": _build_iv_context(options_data),
+        "top_pick": top_pick_dict,
+        "alternatives": alternatives_dicts,
         "all_results_summary": [
             {
                 "name": r.name,
@@ -3911,6 +4186,21 @@ def _build_trade_plan_prompt(
             f"- Highest Call OI (resistance): ₹{options_data.highest_call_oi_strike}\n"
             f"- Highest Put OI (support): ₹{options_data.highest_put_oi_strike}\n"
         )
+        # Append IV/VIX context if available — informs stop placement and
+        # whether the chosen strategy is appropriate for the IV regime
+        iv_ctx = _build_iv_context(options_data)
+        if iv_ctx:
+            options_block += (
+                f"- ATM IV: {iv_ctx['atm_iv_pct']:.1f}%\n"
+                if iv_ctx.get("atm_iv_pct") else ""
+            )
+            if iv_ctx.get("vix_percentile") is not None:
+                options_block += (
+                    f"- India VIX: {iv_ctx['vix_level']:.1f} "
+                    f"(P{iv_ctx['vix_percentile']:.0f} of last 90d, {iv_ctx['vix_regime']})\n"
+                )
+            if iv_ctx.get("trader_guidance"):
+                options_block += f"- IV regime note: {iv_ctx['trader_guidance']}\n"
 
     analyst_block = ""
     if ratings and ratings.get("price_target"):
