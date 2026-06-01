@@ -2144,7 +2144,220 @@ GUARDRAILS
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Chart Pattern Detection
+# ---------------------------------------------------------------------------
+# Detects candlestick + chart patterns (double top/bottom, H&S, triple top/
+# bottom) across daily, 15m, and 5m timeframes. Pattern results cached in
+# Postgres for 24 hours (daily) or 30 minutes (intraday).
+#
+# Two endpoints:
+#   /api/patterns/<symbol>  — single-stock detection across all timeframes
+#   /api/patterns/scan      — batch scan of F&O universe (daily only, cached)
+# ---------------------------------------------------------------------------
+
+# In-memory cache: { (symbol, timeframe): (timestamp, result_dict) }
+_PATTERN_CACHE = {}
+_PATTERN_CACHE_TTL_DAILY    = 6 * 60 * 60     # 6 hours for daily data
+_PATTERN_CACHE_TTL_INTRADAY = 30 * 60         # 30 min for 15m/5m
+
+def _fetch_ohlc_for_patterns(symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLC data from Yahoo for a given symbol + timeframe, suitable
+    for pattern detection. Returns a DataFrame with lowercase open/high/
+    low/close/volume columns, indexed by datetime, sorted ascending.
+
+    Returns None on failure.
+
+    Yahoo timeframe limits:
+      - daily: ~10yr available, we fetch 6mo for performance
+      - 15m: 60d max from Yahoo
+      - 5m:  60d max from Yahoo
+    """
+    yf_symbol = f"{symbol}.NS"
+    try:
+        ticker = yf.Ticker(yf_symbol)
+        if timeframe == "daily":
+            hist = ticker.history(period="6mo", interval="1d")
+        elif timeframe == "15m":
+            hist = ticker.history(period="60d", interval="15m")
+        elif timeframe == "5m":
+            hist = ticker.history(period="30d", interval="5m")
+        else:
+            return None
+
+        if hist.empty or len(hist) < 10:
+            return None
+
+        # Standardize columns to lowercase
+        hist = hist.copy()
+        hist.columns = [str(c).lower() for c in hist.columns]
+        # Make sure we have the required columns
+        if not {"open", "high", "low", "close"}.issubset(set(hist.columns)):
+            return None
+        return hist
+    except Exception as e:
+        logger.warning("Pattern OHLC fetch failed for %s %s: %s", symbol, timeframe, e)
+        return None
+
+
+def _detect_patterns_cached(symbol: str, timeframe: str) -> dict:
+    """
+    Detect patterns for one symbol+timeframe, with in-memory caching.
+    Returns the master pattern_detector output dict; never raises.
+    """
+    import time
+    key = (symbol.upper(), timeframe)
+    now = time.time()
+    ttl = _PATTERN_CACHE_TTL_DAILY if timeframe == "daily" else _PATTERN_CACHE_TTL_INTRADAY
+
+    # Cache hit?
+    if key in _PATTERN_CACHE:
+        cached_at, cached_result = _PATTERN_CACHE[key]
+        if now - cached_at < ttl:
+            return {**cached_result, "cached": True}
+
+    # Fetch and detect
+    df = _fetch_ohlc_for_patterns(symbol, timeframe)
+    if df is None:
+        empty = {
+            "timeframe":      timeframe,
+            "candlesticks":   [],
+            "chart_patterns": [],
+            "summary": {"formed_count": 0, "forming_count": 0,
+                        "bullish_count": 0, "bearish_count": 0},
+            "error":          "no_data",
+        }
+        return empty
+
+    try:
+        # Lazy import to avoid circular issues
+        from pattern_detector import detect_all_patterns
+        result = detect_all_patterns(df, timeframe=timeframe)
+    except Exception as e:
+        logger.exception("Pattern detection failed for %s/%s: %s", symbol, timeframe, e)
+        return {
+            "timeframe":      timeframe,
+            "candlesticks":   [],
+            "chart_patterns": [],
+            "summary": {"formed_count": 0, "forming_count": 0,
+                        "bullish_count": 0, "bearish_count": 0},
+            "error":          str(e),
+        }
+
+    _PATTERN_CACHE[key] = (now, result)
+    return result
+
+
+@app.route("/api/patterns/<symbol>", methods=["GET"])
+@limiter.limit(READ_RATE_LIMIT)
+def get_patterns(symbol):
+    """
+    Get chart + candlestick patterns for a single symbol across daily,
+    15m, and 5m timeframes. Results cached for 6h (daily) / 30min (intraday).
+    """
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return jsonify({"error": "Symbol required"}), 400
+
+    # Fetch all three timeframes (cache makes repeated calls fast)
+    out = {
+        "symbol":      symbol,
+        "fetched_at":  datetime.utcnow().isoformat() + "Z",
+        "daily":       _detect_patterns_cached(symbol, "daily"),
+        "intraday_15m": _detect_patterns_cached(symbol, "15m"),
+        "intraday_5m":  _detect_patterns_cached(symbol, "5m"),
+    }
+    return jsonify(out), 200
+
+
+@app.route("/api/patterns/scan", methods=["GET"])
+@limiter.limit(READ_RATE_LIMIT)
+def scan_patterns():
+    """
+    Scan F&O symbols (sourced from the latest momentum snapshot, which
+    is cron-fed) for active patterns on the DAILY timeframe.
+
+    Pattern detection is cache-backed, so subsequent scans within 6 hours
+    are fast. The first scan may take 30-60 seconds depending on universe
+    size.
+
+    Optional query param: ?limit=N to cap the universe (default: 50).
+    """
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (ValueError, TypeError):
+        limit = 50
+    limit = max(5, min(limit, 150))
+
+    # Source the universe from the momentum snapshot — these are stocks
+    # already known to be active. Cleaner than maintaining a separate
+    # F&O universe list. Falls back to stock_list module if unavailable.
+    universe = []
+    try:
+        with _db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT DISTINCT symbol FROM momentum_snapshot
+                       ORDER BY pct_change DESC NULLS LAST LIMIT %s""",
+                    (limit,))
+                universe = [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        logger.warning("Scan: momentum_snapshot unavailable, using fallback: %s", e)
+        try:
+            from stock_list import FNO_STOCKS
+            universe = FNO_STOCKS[:limit]
+        except Exception:
+            return jsonify({"error": "Universe unavailable"}), 500
+
+    if not universe:
+        return jsonify({"symbols": [], "results": [], "scanned": 0}), 200
+
+    # Run pattern detection on each symbol (daily only — intraday too slow)
+    results = []
+    for sym in universe:
+        try:
+            patterns = _detect_patterns_cached(sym, "daily")
+            total = (len(patterns.get("candlesticks", [])) +
+                     len(patterns.get("chart_patterns", [])))
+            if total == 0:
+                continue   # Skip symbols with no patterns
+            # Compress to summary record for the scanner table
+            results.append({
+                "symbol":         sym,
+                "candlestick_count": len(patterns.get("candlesticks", [])),
+                "chart_pattern_count": len(patterns.get("chart_patterns", [])),
+                "bullish_count":  patterns["summary"]["bullish_count"],
+                "bearish_count":  patterns["summary"]["bearish_count"],
+                "formed_count":   patterns["summary"]["formed_count"],
+                "forming_count":  patterns["summary"]["forming_count"],
+                # Include the top-3 most recent patterns for the table
+                "patterns": (
+                    patterns.get("candlesticks", []) +
+                    patterns.get("chart_patterns", [])
+                )[:3],
+            })
+        except Exception as e:
+            logger.warning("Pattern scan failed for %s: %s", sym, e)
+
+    # Sort: most patterns first, then most bullish-skewed
+    results.sort(key=lambda r: (r["formed_count"], abs(r["bullish_count"] - r["bearish_count"])),
+                  reverse=True)
+
+    return jsonify({
+        "scanned":     len(universe),
+        "with_patterns": len(results),
+        "results":     results,
+        "fetched_at":  datetime.utcnow().isoformat() + "Z",
+    }), 200
+
+
+def _db_conn():
+    """Thin wrapper to get a DB connection (used by scan endpoint)."""
+    return psycopg2.connect(DATABASE_URL)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints (existing)
 # ---------------------------------------------------------------------------
 @app.route("/api/options", methods=["POST"])
 @limiter.limit(AI_RATE_LIMIT)
@@ -2270,6 +2483,10 @@ def analyze_stock():
         "news":        news,
         "analysis":    analysis_text,
         "model":       ANTHROPIC_MODEL,
+        # Chart patterns — daily timeframe only here (intraday available via
+        # the /api/patterns/<symbol> endpoint to keep /api/analyze fast).
+        # This call uses the in-memory cache so usually returns in <100ms.
+        "patterns":    _detect_patterns_cached(symbol, "daily"),
     }), 200
 
 
