@@ -85,34 +85,135 @@ class OptionChainData:
     top_strikes: list = field(default_factory=list)
     confirmations: list = field(default_factory=list)
 
+    # IV / Greeks (added 2026 — populated by Upstox response or BS fallback)
+    # atm_iv: average of ATM call+put IV, decimal form (0.25 = 25%)
+    # days_to_expiry: integer days from today to expiry_date
+    # Each entry in top_strikes also gets call_iv, put_iv, call_*, put_* Greek fields.
+    atm_iv: Optional[float] = None
+    days_to_expiry: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-def _safe_int(val, default=0) -> int:
-    try:
-        return int(val or default)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_float(val, default=0.0) -> float:
-    try:
-        return float(val or default)
-    except (TypeError, ValueError):
-        return default
-
-
 def _extract_market_data(option_block: dict) -> tuple[int, int, int, float, float]:
     md = (option_block or {}).get("market_data") or {}
-    oi          = _safe_int(md.get("oi", 0))
-    prev_oi     = _safe_int(md.get("prev_oi", 0))
-    volume      = _safe_int(md.get("volume", 0))
-    close_price = _safe_float(md.get("close_price", 0))
-    ltp         = _safe_float(md.get("ltp", 0))
+    oi          = int(md.get("oi", 0) or 0)
+    prev_oi     = int(md.get("prev_oi", 0) or 0)
+    volume      = int(md.get("volume", 0) or 0)
+    close_price = float(md.get("close_price", 0) or 0)
+    ltp         = float(md.get("ltp", 0) or 0)
     if ltp <= 0 and close_price > 0:
         ltp = close_price
     return oi, prev_oi, volume, close_price, ltp
+
+
+def _extract_greeks_from_upstox(option_block: dict) -> dict:
+    """
+    Try to pull IV + Greeks directly from Upstox's response if present.
+    Upstox /v2/option/chain may include an `option_greeks` sub-object
+    with `iv`, `delta`, `gamma`, `theta`, `vega`. Field names sometimes
+    vary by API version, so we accept multiple key variants.
+
+    Returns dict with keys "iv", "delta", "gamma", "theta", "vega" —
+    any field missing/null gets `None`. Caller decides whether to
+    compute the missing pieces via Black-Scholes.
+    """
+    if not option_block:
+        return {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+    g = option_block.get("option_greeks") or option_block.get("greeks") or {}
+
+    def _safe_float(value):
+        try:
+            v = float(value)
+            # Reject NaN / inf / sentinel zeros that aren't real
+            if v != v or v == float("inf") or v == float("-inf"):
+                return None
+            return v
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "iv":     _safe_float(g.get("iv") or g.get("implied_volatility")),
+        "delta":  _safe_float(g.get("delta")),
+        "gamma":  _safe_float(g.get("gamma")),
+        "theta":  _safe_float(g.get("theta")),
+        "vega":   _safe_float(g.get("vega")),
+    }
+
+
+def _compute_days_to_expiry(expiry_str: str) -> int:
+    """Parse an expiry string like '2026-06-30' into days-from-today (>=0)."""
+    from datetime import date, datetime
+    if not expiry_str:
+        return 0
+    try:
+        # Accept either 'YYYY-MM-DD' or 'YYYY-MM-DDT...'
+        d = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
+        delta = (d - date.today()).days
+        return max(delta, 0)
+    except Exception:
+        return 0
+
+
+def _resolve_iv_and_greeks(option_block: dict, spot: float, strike: float,
+                            days_to_expiry: int, ltp: float,
+                            opt_type: str) -> dict:
+    """
+    Best-effort IV + Greeks resolution.
+
+    Order of preference:
+      1. Use Upstox-provided IV + Greeks if available
+      2. If Upstox provides IV only → compute Greeks via BS using that IV
+      3. If neither → reverse-solve IV from LTP, then compute Greeks
+      4. If LTP is 0 / negative / invalid → return all-None (no data)
+
+    Returns: {"iv", "delta", "gamma", "theta", "vega"} — values may be None.
+    """
+    # Lazy import to avoid circular issues
+    from greeks import implied_volatility, black_scholes_greeks
+
+    upstox = _extract_greeks_from_upstox(option_block)
+
+    # Some Upstox responses return IV in PERCENT (e.g., 25.5) instead of
+    # decimal (0.255). Normalize: if IV > 5.0 we assume it's a percent.
+    iv = upstox.get("iv")
+    if iv is not None and iv > 5.0:
+        iv = iv / 100.0
+
+    # If Upstox returned all four Greeks, use them as-is (just ensure scale)
+    if (iv is not None and upstox.get("delta") is not None
+            and upstox.get("gamma") is not None
+            and upstox.get("theta") is not None
+            and upstox.get("vega")  is not None):
+        return {
+            "iv":    round(iv, 4),
+            "delta": upstox["delta"],
+            "gamma": upstox["gamma"],
+            "theta": upstox["theta"],
+            "vega":  upstox["vega"],
+        }
+
+    # Reverse-solve IV from LTP if not given
+    if iv is None:
+        if ltp <= 0 or days_to_expiry <= 0 or spot <= 0 or strike <= 0:
+            # No way to compute IV → return all-None
+            return {"iv": None, "delta": None, "gamma": None,
+                    "theta": None, "vega": None}
+        iv = implied_volatility(spot, strike, ltp, days_to_expiry, opt_type)
+        if iv is None:
+            return {"iv": None, "delta": None, "gamma": None,
+                    "theta": None, "vega": None}
+
+    # Compute Greeks via Black-Scholes using the IV
+    greeks = black_scholes_greeks(spot, strike, days_to_expiry, iv, opt_type)
+    return {
+        "iv":    round(iv, 4),
+        "delta": greeks["delta"],
+        "gamma": greeks["gamma"],
+        "theta": greeks["theta"],
+        "vega":  greeks["vega"],
+    }
 
 
 def _compute_max_pain(rows: list) -> float:
@@ -323,6 +424,10 @@ def fetch_options_data(symbol: str, underlying_price: float) -> Optional[OptionC
     highest_call_oi = 0
     highest_put_oi  = 0
 
+    # Compute days-to-expiry once (used for Greeks fallback)
+    days_to_expiry = _compute_days_to_expiry(expiry)
+    data.days_to_expiry = days_to_expiry
+
     strike_summary = []
     strikes_with_ltp = 0
 
@@ -331,6 +436,16 @@ def fetch_options_data(symbol: str, underlying_price: float) -> Optional[OptionC
 
         call_oi, call_prev_oi, call_volume, _, call_ltp = _extract_market_data(row.get("call_options"))
         put_oi,  put_prev_oi,  put_volume,  _, put_ltp  = _extract_market_data(row.get("put_options"))
+
+        # IV + Greeks: prefer Upstox-provided values, fallback to BS computation
+        call_iv_greeks = _resolve_iv_and_greeks(
+            row.get("call_options"), underlying_price, strike,
+            days_to_expiry, call_ltp, "call",
+        )
+        put_iv_greeks  = _resolve_iv_and_greeks(
+            row.get("put_options"), underlying_price, strike,
+            days_to_expiry, put_ltp, "put",
+        )
 
         call_oi_change = call_oi - call_prev_oi
         put_oi_change  = put_oi  - put_prev_oi
@@ -362,6 +477,17 @@ def fetch_options_data(symbol: str, underlying_price: float) -> Optional[OptionC
             "distance_from_spot":  strike - underlying_price,
             "call_ltp":            call_ltp,
             "put_ltp":             put_ltp,
+            # IV + Greeks per side (None if unavailable)
+            "call_iv":             call_iv_greeks.get("iv"),
+            "call_delta":          call_iv_greeks.get("delta"),
+            "call_gamma":          call_iv_greeks.get("gamma"),
+            "call_theta":          call_iv_greeks.get("theta"),
+            "call_vega":           call_iv_greeks.get("vega"),
+            "put_iv":              put_iv_greeks.get("iv"),
+            "put_delta":           put_iv_greeks.get("delta"),
+            "put_gamma":           put_iv_greeks.get("gamma"),
+            "put_theta":           put_iv_greeks.get("theta"),
+            "put_vega":            put_iv_greeks.get("vega"),
         })
 
     logger.info(
@@ -381,6 +507,21 @@ def fetch_options_data(symbol: str, underlying_price: float) -> Optional[OptionC
     # ---- Top strikes ----
     strike_summary.sort(key=lambda x: x["total_oi"], reverse=True)
     data.top_strikes = strike_summary[:8]
+
+    # ---- ATM IV: average call+put IV at the strike nearest to spot ----
+    # Uses the full strike_summary (not just top OI) so we get a real ATM,
+    # not whichever strike happened to have the most OI. Falls back to None
+    # if no nearby strike has valid IV data.
+    if strike_summary:
+        from greeks import compute_atm_iv
+        # Re-sort by proximity to spot for ATM finding
+        proximity_sorted = sorted(strike_summary,
+                                  key=lambda s: abs(s["strike"] - underlying_price))
+        data.atm_iv = compute_atm_iv(proximity_sorted[:5], underlying_price,
+                                      data.days_to_expiry)
+        if data.atm_iv is not None:
+            logger.info("ATM IV for %s: %.2f%% (DTE=%d)",
+                        symbol, data.atm_iv * 100, data.days_to_expiry)
 
     # ---- Classify signals (buildup no longer needs PCR) ----
     data.pcr_signal     = _classify_pcr(data.pcr_oi)
