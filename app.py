@@ -2424,6 +2424,260 @@ def _check_pattern_detector_importable() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# AI Analysis ↔ Pattern Alignment
+# ---------------------------------------------------------------------------
+# Mechanical patterns (Hammer, Double Bottom, H&S, etc) are useful on their
+# own, but their value is amplified when an independent AI analysis arrives
+# at the SAME conclusion. This module heuristically extracts:
+#
+#   1. Direction sentiment (bullish/bearish/neutral) from AI text
+#   2. Price levels mentioned in AI text (support/resistance/target/stop)
+#
+# Then for each detected pattern, computes:
+#   - Direction alignment (aligned/divergent/neutral)
+#   - Price-level proximity matches (e.g., pattern target ₹2,450 ≈ AI
+#     target ₹2,460 — 0.4% diff)
+#
+# The result is shown in the Analyze tab's pattern card as small badges
+# so the trader sees at-a-glance whether mechanical + AI signals agree.
+# ---------------------------------------------------------------------------
+
+# Pattern proximity tolerance: ±2.5% of the pattern price.
+# Chosen empirically — tight enough to mean "same level", loose enough
+# to absorb the AI's rounding (e.g., AI says "₹2,450" when actual is ₹2,447)
+_PRICE_MATCH_TOLERANCE_PCT = 2.5
+
+# Direction keywords — these are intentionally simple. AI text uses these
+# words in obvious ways most of the time. The few edge cases (e.g., "not
+# bearish" parsed as bearish) are acceptable noise — overall sentiment is
+# determined by aggregate count.
+_BULL_KEYWORDS = [
+    "bullish", "buy", " long ", "accumulate", "outperform", "uptrend",
+    "rally", "breakout", "upside", "positive momentum", "strong buy",
+]
+_BEAR_KEYWORDS = [
+    "bearish", "sell", " short ", "exit", "underperform", "downtrend",
+    "breakdown", "decline", "downside", "weakness", "negative momentum",
+]
+_NEUTRAL_KEYWORDS = [
+    "neutral", "sideways", "range-bound", "rangebound", "wait", "watch",
+    "consolidat", "indecis",
+]
+
+
+def _extract_ai_signals(analysis_text: str) -> dict:
+    """
+    Heuristically extract directional sentiment + mentioned price levels
+    from the AI's free-text analysis. Never raises.
+
+    Returns a dict with:
+      - direction:    "bullish" | "bearish" | "neutral"
+      - bull_score:   count of bullish keywords
+      - bear_score:   count of bearish keywords
+      - neut_score:   count of neutral keywords
+      - confidence:   "high" | "medium" | "low" (based on score margin)
+      - price_levels: list of {price, type, context} dicts
+    """
+    if not analysis_text or not isinstance(analysis_text, str):
+        return {
+            "direction":     "neutral",
+            "bull_score":    0,
+            "bear_score":    0,
+            "neut_score":    0,
+            "confidence":    "low",
+            "price_levels":  [],
+        }
+
+    text_lower = analysis_text.lower()
+    bull = sum(text_lower.count(kw) for kw in _BULL_KEYWORDS)
+    bear = sum(text_lower.count(kw) for kw in _BEAR_KEYWORDS)
+    neut = sum(text_lower.count(kw) for kw in _NEUTRAL_KEYWORDS)
+
+    # Determine overall direction by majority. Require a margin to avoid
+    # false confidence — if bull and bear scores are within 1 of each other,
+    # treat as neutral.
+    margin = abs(bull - bear)
+    if bull > bear and bull >= max(neut, 2) and margin >= 2:
+        direction = "bullish"
+        confidence = "high" if margin >= 4 else "medium"
+    elif bear > bull and bear >= max(neut, 2) and margin >= 2:
+        direction = "bearish"
+        confidence = "high" if margin >= 4 else "medium"
+    else:
+        direction = "neutral"
+        confidence = "medium" if neut >= 2 else "low"
+
+    # Price level extraction. Look for ₹X,XXX or ₹X.XX patterns, then
+    # examine surrounding text for a context label (support/resistance/
+    # target/stop/entry). When multiple keywords appear in the surrounding
+    # window, the one CLOSEST to the price wins — that's the most likely
+    # label for this specific number.
+    price_pattern = re.compile(r'₹\s*([\d,]+(?:\.\d+)?)')
+    _LEVEL_KEYWORDS = [
+        ("stop loss",  "stop"),       # check multi-word first
+        ("stop-loss",  "stop"),
+        ("stop",       "stop"),
+        ("support",    "support"),
+        ("resistance", "resistance"),
+        ("target",     "target"),
+        ("entry",      "entry"),
+        ("key level",  "level"),
+        ("pivot",      "level"),
+    ]
+    levels = []
+    seen_prices = set()
+    for m in price_pattern.finditer(analysis_text):
+        try:
+            raw = m.group(1).replace(",", "")
+            price = float(raw)
+            if price < 1 or price > 1000000:
+                continue
+            # Use a slightly narrower window biased toward text BEFORE the
+            # price (most "label ₹price" phrasing), with a smaller forward
+            # window to catch trailing labels too.
+            window_start = max(0, m.start() - 50)
+            window_end   = min(len(analysis_text), m.end() + 20)
+            window_text  = analysis_text[window_start:window_end].lower()
+            price_pos_in_window = m.start() - window_start
+            # Find the CLOSEST keyword to the price by character distance
+            best_label = "mentioned"
+            best_dist  = float("inf")
+            for kw, label in _LEVEL_KEYWORDS:
+                kw_pos = window_text.rfind(kw, 0, price_pos_in_window)
+                if kw_pos == -1:
+                    # Also try forward search (label after price, rare)
+                    kw_pos = window_text.find(kw, price_pos_in_window)
+                    if kw_pos == -1:
+                        continue
+                    dist = kw_pos - price_pos_in_window
+                else:
+                    dist = price_pos_in_window - kw_pos
+                if dist < best_dist:
+                    best_dist  = dist
+                    best_label = label
+            dedup_key = (round(price, 1), best_label)
+            if dedup_key in seen_prices:
+                continue
+            seen_prices.add(dedup_key)
+            levels.append({
+                "price":   round(price, 2),
+                "type":    best_label,
+                "context": window_text.strip()[:80],
+            })
+        except (ValueError, IndexError):
+            continue
+
+    return {
+        "direction":     direction,
+        "bull_score":    bull,
+        "bear_score":    bear,
+        "neut_score":    neut,
+        "confidence":    confidence,
+        "price_levels":  levels,
+    }
+
+
+def _compute_pattern_alignment(patterns_data: dict, ai_signals: dict) -> dict:
+    """
+    For each pattern in the patterns_data dict, annotate it with alignment
+    info comparing pattern direction + key prices to the AI's thesis.
+
+    Mutates and returns the patterns_data dict. Never raises.
+
+    The annotation added to each pattern is an `ai_alignment` field:
+      {
+        "direction": "aligned" | "divergent" | "neutral",
+        "ai_direction":  "bullish" | "bearish" | "neutral",
+        "ai_confidence": "high" | "medium" | "low",
+        "price_matches": [
+          {
+            "pattern_field":  "neckline" | "target",
+            "pattern_price":  float,
+            "ai_type":        "support" | "resistance" | "target" | ...,
+            "ai_price":       float,
+            "pct_diff":       float,
+          },
+          ...
+        ]
+      }
+    """
+    if not patterns_data or not ai_signals:
+        return patterns_data
+
+    ai_dir = ai_signals.get("direction", "neutral")
+    ai_conf = ai_signals.get("confidence", "low")
+    ai_levels = ai_signals.get("price_levels", [])
+
+    def _annotate(p):
+        if not isinstance(p, dict):
+            return p
+        p_dir = p.get("type", "neutral")
+        # Direction alignment classification
+        if p_dir == "neutral" or ai_dir == "neutral":
+            dir_align = "neutral"
+        elif p_dir == ai_dir:
+            dir_align = "aligned"
+        else:
+            dir_align = "divergent"
+        # Price-level proximity (only chart patterns have neckline/target)
+        price_matches = []
+        for key in ("neckline", "target"):
+            p_price = p.get(key)
+            if p_price is None or not isinstance(p_price, (int, float)):
+                continue
+            if p_price <= 0:
+                continue
+            for level in ai_levels:
+                ai_price = level.get("price")
+                if not isinstance(ai_price, (int, float)) or ai_price <= 0:
+                    continue
+                pct_diff = abs(p_price - ai_price) / p_price * 100
+                if pct_diff <= _PRICE_MATCH_TOLERANCE_PCT:
+                    price_matches.append({
+                        "pattern_field":  key,
+                        "pattern_price":  round(p_price, 2),
+                        "ai_type":        level.get("type", "mentioned"),
+                        "ai_price":       round(ai_price, 2),
+                        "pct_diff":       round(pct_diff, 2),
+                    })
+        # Limit to top 2 closest matches to avoid noise
+        price_matches.sort(key=lambda m: m["pct_diff"])
+        price_matches = price_matches[:2]
+
+        p["ai_alignment"] = {
+            "direction":      dir_align,
+            "ai_direction":   ai_dir,
+            "ai_confidence":  ai_conf,
+            "price_matches":  price_matches,
+        }
+        return p
+
+    for tf_key in ("candlesticks", "chart_patterns"):
+        if tf_key in patterns_data and isinstance(patterns_data[tf_key], list):
+            patterns_data[tf_key] = [_annotate(p) for p in patterns_data[tf_key]]
+
+    # Also add a summary at the top level for the card header
+    all_patterns = (patterns_data.get("candlesticks", []) +
+                    patterns_data.get("chart_patterns", []))
+    aligned_count   = sum(1 for p in all_patterns
+                           if p.get("ai_alignment", {}).get("direction") == "aligned")
+    divergent_count = sum(1 for p in all_patterns
+                           if p.get("ai_alignment", {}).get("direction") == "divergent")
+    price_match_count = sum(len(p.get("ai_alignment", {}).get("price_matches", []))
+                             for p in all_patterns)
+
+    patterns_data["ai_alignment_summary"] = {
+        "ai_direction":      ai_dir,
+        "ai_confidence":     ai_conf,
+        "aligned_count":     aligned_count,
+        "divergent_count":   divergent_count,
+        "price_match_count": price_match_count,
+        "total_patterns":    len(all_patterns),
+    }
+    return patterns_data
+
+
+# ---------------------------------------------------------------------------
 # Endpoints (existing)
 # ---------------------------------------------------------------------------
 @app.route("/api/options", methods=["POST"])
@@ -2541,6 +2795,19 @@ def analyze_stock():
             "iv_context":             _build_iv_context(options),
         }
 
+    # Detect patterns (daily timeframe), then cross-reference with the
+    # AI analysis to add alignment annotations. Both steps are best-effort:
+    # if either fails we fall back to the raw patterns dict.
+    try:
+        patterns_with_alignment = _detect_patterns_cached(symbol, "daily")
+        ai_signals = _extract_ai_signals(analysis_text)
+        patterns_with_alignment = _compute_pattern_alignment(
+            patterns_with_alignment, ai_signals
+        )
+    except Exception as e:
+        logger.warning("Pattern alignment failed for %s: %s", symbol, e)
+        patterns_with_alignment = _detect_patterns_cached(symbol, "daily")
+
     return jsonify({
         "symbol":      symbol,
         "analyzed_at": datetime.utcnow().isoformat() + "Z",
@@ -2550,10 +2817,9 @@ def analyze_stock():
         "news":        news,
         "analysis":    analysis_text,
         "model":       ANTHROPIC_MODEL,
-        # Chart patterns — daily timeframe only here (intraday available via
-        # the /api/patterns/<symbol> endpoint to keep /api/analyze fast).
-        # This call uses the in-memory cache so usually returns in <100ms.
-        "patterns":    _detect_patterns_cached(symbol, "daily"),
+        # Chart patterns + AI-thesis alignment annotations. Daily timeframe
+        # only here (intraday is available via /api/patterns/<symbol>).
+        "patterns":    patterns_with_alignment,
     }), 200
 
 
