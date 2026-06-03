@@ -1213,12 +1213,446 @@ Constraints:
 Return ONLY the JSON, no markdown fences, no preamble."""
 
 
+# ---------------------------------------------------------------------------
+# Capital Allocation
+# ---------------------------------------------------------------------------
+# Compares the trader's TARGET allocation framework (user-defined, sent in
+# the request) against the ACTUAL allocation derived from open journal
+# positions. Four dimensions:
+#
+#   1. By Direction   — long_bias / short_bias / hedged / cash
+#   2. By Time Horizon — today / swing (2-5d) / positional (>5d) / cash
+#   3. By Sector      — Banking / IT / Pharma / Auto / Energy / Other / cash
+#   4. By Strategy Type — derived from setup_type:
+#         momentum, mean_reversion, event_driven, swing, other
+#
+# Two endpoints:
+#   GET  /api/capital-allocation  — returns actual allocation breakdown
+#   POST /api/capital-allocation/recommend — AI regime-adjusted target
+#         suggestions based on user's base targets + India VIX percentile
+# ---------------------------------------------------------------------------
+
+# Setup_type → strategy_type bucket mapping
+_STRATEGY_TYPE_BUCKETS = {
+    "breakout":       "momentum",
+    "momentum":       "momentum",
+    "reversal":       "mean_reversion",
+    "mean_reversion": "mean_reversion",
+    "earnings":       "event_driven",
+    "news_based":     "event_driven",
+    "swing":          "swing",
+    "other":          "other",
+}
+
+
+def _classify_time_horizon(entry_date_str) -> str:
+    """
+    Classify a held position by how long it's been held.
+    For open positions (which the journal returns), this measures elapsed
+    days from entry, not intended holding period.
+
+    Returns: "today" | "swing" | "positional"
+    """
+    if not entry_date_str:
+        return "swing"
+    try:
+        if isinstance(entry_date_str, (date, datetime)):
+            entry_d = entry_date_str if isinstance(entry_date_str, date) else entry_date_str.date()
+        else:
+            entry_d = datetime.strptime(str(entry_date_str)[:10], "%Y-%m-%d").date()
+        days_held = (date.today() - entry_d).days
+        if days_held <= 1:
+            return "today"
+        elif days_held <= 5:
+            return "swing"
+        else:
+            return "positional"
+    except Exception:
+        return "swing"
+
+
+def _classify_strategy_type(setup_type) -> str:
+    """Map journal's setup_type field to a strategy-type allocation bucket."""
+    if not setup_type:
+        return "other"
+    return _STRATEGY_TYPE_BUCKETS.get(str(setup_type).lower(), "other")
+
+
+def _classify_direction(direction) -> str:
+    """
+    Map a journal direction to the allocation bucket.
+    Note: journal uses lowercase 'long'/'short'/'hedged'.
+    """
+    d = (direction or "long").lower()
+    if d in ("long", "short", "hedged"):
+        return d
+    return "long"   # default
+
+
+def _compute_allocation_breakdown(positions: list, portfolio_size: float) -> dict:
+    """
+    Given enriched positions (with current_value + sector) and portfolio size,
+    compute allocation breakdown across all 4 dimensions.
+
+    Each position contributes its `current_value` (notional exposure) to the
+    appropriate buckets. Cash = portfolio_size - sum of deployed.
+
+    Returns a dict with `by_direction`, `by_time_horizon`, `by_sector`,
+    `by_strategy_type` — each is {bucket_name: {capital, pct, positions}}.
+    """
+    total_deployed = sum(float(p.get("current_value") or 0) for p in positions)
+    cash_available = max(0, portfolio_size - total_deployed)
+    cash_pct = (cash_available / portfolio_size * 100) if portfolio_size > 0 else 0
+
+    # Initialize buckets for each dimension
+    by_direction = {"long": 0.0, "short": 0.0, "hedged": 0.0}
+    by_time_horizon = {"today": 0.0, "swing": 0.0, "positional": 0.0}
+    by_sector = {}     # populated dynamically
+    by_strategy = {"momentum": 0.0, "mean_reversion": 0.0, "event_driven": 0.0,
+                   "swing": 0.0, "other": 0.0}
+
+    counts_dir = {"long": 0, "short": 0, "hedged": 0}
+    counts_horizon = {"today": 0, "swing": 0, "positional": 0}
+    counts_sector = {}
+    counts_strategy = {"momentum": 0, "mean_reversion": 0, "event_driven": 0,
+                       "swing": 0, "other": 0}
+
+    for p in positions:
+        cap = float(p.get("current_value") or 0)
+        if cap <= 0:
+            continue
+        # Direction
+        d = _classify_direction(p.get("direction"))
+        by_direction[d] += cap
+        counts_dir[d] += 1
+        # Time horizon
+        th = _classify_time_horizon(p.get("entry_date") or p.get("entry_date_str"))
+        by_time_horizon[th] += cap
+        counts_horizon[th] += 1
+        # Sector
+        sec = (p.get("sector") or "Other").strip() or "Other"
+        by_sector[sec] = by_sector.get(sec, 0.0) + cap
+        counts_sector[sec] = counts_sector.get(sec, 0) + 1
+        # Strategy type
+        st = _classify_strategy_type(p.get("setup_type"))
+        by_strategy[st] += cap
+        counts_strategy[st] += 1
+
+    def _to_pct_dict(bucket_dict, count_dict, portfolio):
+        """Convert {bucket: capital} to {bucket: {capital, pct, positions}}."""
+        out = {}
+        for k, v in bucket_dict.items():
+            pct = (v / portfolio * 100) if portfolio > 0 else 0
+            out[k] = {
+                "capital":   round(v, 2),
+                "pct":       round(pct, 2),
+                "positions": count_dict.get(k, 0),
+            }
+        return out
+
+    result = {
+        "portfolio_size":  round(portfolio_size, 2),
+        "total_deployed":  round(total_deployed, 2),
+        "cash_available":  round(cash_available, 2),
+        "cash_pct":        round(cash_pct, 2),
+        "deployment_pct":  round(100 - cash_pct, 2),
+        "open_positions":  len(positions),
+        "by_direction":    _to_pct_dict(by_direction, counts_dir, portfolio_size),
+        "by_time_horizon": _to_pct_dict(by_time_horizon, counts_horizon, portfolio_size),
+        "by_sector":       _to_pct_dict(by_sector, counts_sector, portfolio_size),
+        "by_strategy_type": _to_pct_dict(by_strategy, counts_strategy, portfolio_size),
+    }
+    # Add a "cash" entry to each dimension so the frontend can render a
+    # complete pie/bar without separate handling for cash
+    for dim in ("by_direction", "by_time_horizon", "by_sector", "by_strategy_type"):
+        result[dim]["cash"] = {
+            "capital":   round(cash_available, 2),
+            "pct":       round(cash_pct, 2),
+            "positions": 0,
+        }
+    return result
+
+
+@app.route("/api/capital-allocation", methods=["GET"])
+@limiter.limit(READ_RATE_LIMIT)
+def get_capital_allocation():
+    """
+    Return current capital allocation breakdown across direction, time
+    horizon, sector, and strategy type.
+
+    Query params:
+      ?portfolio=N   — portfolio size in INR (required; default 1,000,000)
+
+    Reuses the same _fetch_symbol_risk_data helper as the Risk Dashboard
+    so sector/price data is consistent between the two tabs.
+    """
+    try:
+        portfolio_size = float(request.args.get("portfolio", 1000000))
+        if portfolio_size <= 0:
+            portfolio_size = 1000000
+    except (ValueError, TypeError):
+        portfolio_size = 1000000
+
+    try:
+        import journal_store
+    except Exception as e:
+        return jsonify({"error": f"Journal module unavailable: {e}"}), 500
+
+    try:
+        positions_raw = journal_store.list_trades(status="open", limit=200)
+    except Exception as e:
+        logger.exception("Allocation: list_trades failed")
+        return jsonify({"error": f"Failed to load positions: {e}"}), 500
+
+    # Empty book case
+    if not positions_raw:
+        return jsonify({
+            "portfolio_size":   portfolio_size,
+            "total_deployed":   0,
+            "cash_available":   portfolio_size,
+            "cash_pct":         100,
+            "deployment_pct":   0,
+            "open_positions":   0,
+            "by_direction":     {"long": {"capital": 0, "pct": 0, "positions": 0},
+                                  "short": {"capital": 0, "pct": 0, "positions": 0},
+                                  "hedged": {"capital": 0, "pct": 0, "positions": 0},
+                                  "cash":  {"capital": portfolio_size, "pct": 100, "positions": 0}},
+            "by_time_horizon":  {"today": {"capital": 0, "pct": 0, "positions": 0},
+                                  "swing": {"capital": 0, "pct": 0, "positions": 0},
+                                  "positional": {"capital": 0, "pct": 0, "positions": 0},
+                                  "cash": {"capital": portfolio_size, "pct": 100, "positions": 0}},
+            "by_sector":        {"cash": {"capital": portfolio_size, "pct": 100, "positions": 0}},
+            "by_strategy_type": {"momentum": {"capital": 0, "pct": 0, "positions": 0},
+                                  "mean_reversion": {"capital": 0, "pct": 0, "positions": 0},
+                                  "event_driven": {"capital": 0, "pct": 0, "positions": 0},
+                                  "swing": {"capital": 0, "pct": 0, "positions": 0},
+                                  "other": {"capital": 0, "pct": 0, "positions": 0},
+                                  "cash": {"capital": portfolio_size, "pct": 100, "positions": 0}},
+            "as_of":            datetime.utcnow().isoformat() + "Z",
+            "note":             "No open positions",
+        }), 200
+
+    # Fetch live price + sector in parallel (reuse risk-dashboard helper)
+    unique_symbols = list({p["symbol"] for p in positions_raw})
+    symbol_data = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(unique_symbols))) as executor:
+        future_map = {executor.submit(_fetch_symbol_risk_data, s): s
+                       for s in unique_symbols}
+        for fut in future_map:
+            sym = future_map[fut]
+            try:
+                symbol_data[sym] = fut.result(timeout=10)
+            except Exception as e:
+                logger.warning("Allocation: data fetch failed for %s: %s", sym, e)
+                symbol_data[sym] = {"current_price": None, "beta": 1.0, "sector": "Other"}
+
+    # Enrich each position with current_value and sector
+    enriched = []
+    for p in positions_raw:
+        sym = p.get("symbol", "")
+        live = symbol_data.get(sym, {"current_price": None, "sector": "Other"})
+        qty = int(p.get("qty") or 0)
+        entry = float(p.get("entry_price") or 0)
+        cur = float(live["current_price"]) if live["current_price"] else entry
+        enriched.append({
+            "symbol":         sym,
+            "direction":      p.get("direction") or "long",
+            "qty":            qty,
+            "entry_price":    entry,
+            "current_price":  cur,
+            "current_value":  qty * cur,
+            "sector":         live.get("sector") or "Other",
+            "entry_date":     p.get("entry_date"),
+            "setup_type":     p.get("setup_type"),
+        })
+
+    breakdown = _compute_allocation_breakdown(enriched, portfolio_size)
+    breakdown["as_of"] = datetime.utcnow().isoformat() + "Z"
+    return jsonify(breakdown), 200
+
+
+@app.route("/api/capital-allocation/recommend", methods=["POST"])
+@limiter.limit(AI_RATE_LIMIT)
+def recommend_capital_allocation():
+    """
+    AI-suggested regime adjustments to user's base allocation targets.
+
+    Request body:
+      {
+        "portfolio_size": 1000000,
+        "user_targets": {
+          "cash_reserve_pct": 20,
+          "by_direction": {"long": 40, "short": 20, "hedged": 20},
+          "by_time_horizon": {"today": 10, "swing": 30, "positional": 40},
+          "by_sector_max_pct": 30,
+          "by_strategy_type": {"momentum": 30, "mean_reversion": 20, ...}
+        }
+      }
+
+    Response:
+      {
+        "regime": {"vix_level": 16.5, "vix_percentile": 45, "label": "normal"},
+        "adjusted_targets": {... same shape as user_targets but adjusted ...},
+        "rationale": "<short explanation>",
+        "actions": ["...","..."]   # concrete action items
+      }
+    """
+    if not anthropic_client:
+        return jsonify({"error": "ANTHROPIC_API_KEY not set"}), 500
+
+    body = request.get_json(silent=True) or {}
+    user_targets = body.get("user_targets") or {}
+    portfolio_size = float(body.get("portfolio_size") or 1000000)
+
+    if not user_targets:
+        return jsonify({"error": "user_targets required in request body"}), 400
+
+    # Get current actual allocation (re-use the helper logic) for context
+    try:
+        import journal_store
+        positions_raw = journal_store.list_trades(status="open", limit=200)
+    except Exception:
+        positions_raw = []
+
+    # Get VIX regime (already cached for IV banner)
+    vix_pct = None
+    vix_level = None
+    vix_label = "normal"
+    try:
+        vix_info = _compute_vix_percentile_90d()
+        vix_pct = vix_info.get("percentile")
+        vix_level = vix_info.get("current")
+        vix_label = vix_info.get("regime") or "normal"
+    except Exception as e:
+        logger.warning("Allocation recommend: VIX fetch failed: %s", e)
+
+    # Build a compact summary of the actual allocation
+    if positions_raw:
+        unique_symbols = list({p["symbol"] for p in positions_raw})
+        symbol_data = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(unique_symbols))) as executor:
+            future_map = {executor.submit(_fetch_symbol_risk_data, s): s
+                           for s in unique_symbols}
+            for fut in future_map:
+                sym = future_map[fut]
+                try:
+                    symbol_data[sym] = fut.result(timeout=10)
+                except Exception:
+                    symbol_data[sym] = {"current_price": None, "sector": "Other"}
+        enriched = []
+        for p in positions_raw:
+            sym = p.get("symbol", "")
+            live = symbol_data.get(sym, {"current_price": None, "sector": "Other"})
+            qty = int(p.get("qty") or 0)
+            entry = float(p.get("entry_price") or 0)
+            cur = float(live["current_price"]) if live["current_price"] else entry
+            enriched.append({
+                "symbol": sym, "direction": p.get("direction") or "long",
+                "qty": qty, "entry_price": entry, "current_price": cur,
+                "current_value": qty * cur, "sector": live.get("sector") or "Other",
+                "entry_date": p.get("entry_date"), "setup_type": p.get("setup_type"),
+            })
+        actual = _compute_allocation_breakdown(enriched, portfolio_size)
+    else:
+        actual = {"deployment_pct": 0, "cash_pct": 100, "by_direction": {},
+                   "by_sector": {}, "open_positions": 0}
+
+    # Compact compact summary for the AI prompt
+    actual_summary = {
+        "deployment_pct": actual.get("deployment_pct"),
+        "cash_pct":       actual.get("cash_pct"),
+        "open_positions": actual.get("open_positions"),
+        "by_direction": {k: v.get("pct", 0) for k, v in actual.get("by_direction", {}).items()},
+        "by_sector":    {k: v.get("pct", 0) for k, v in actual.get("by_sector", {}).items()},
+    }
+
+    prompt = f"""You are advising an Indian F&O retail trader on capital allocation
+adjustments based on current market regime. Be concise and actionable.
+
+MARKET REGIME:
+- India VIX: {vix_level if vix_level else 'unknown'}
+- VIX percentile (90-day): {vix_pct if vix_pct else 'unknown'}
+- Regime label: {vix_label}
+
+USER'S BASE TARGETS:
+{json.dumps(user_targets, indent=2)}
+
+CURRENT ACTUAL ALLOCATION (from open positions):
+{json.dumps(actual_summary, indent=2)}
+
+TASK:
+Suggest regime-adjusted target percentages (only modify where VIX regime warrants
+a change). Return a JSON object with this exact shape:
+
+{{
+  "adjusted_targets": {{
+    "cash_reserve_pct": <number>,
+    "by_direction": {{"long": <num>, "short": <num>, "hedged": <num>}},
+    "by_strategy_type": {{ ...same buckets as user_targets... }}
+  }},
+  "rationale": "<2-3 sentence explanation of WHY the adjustments fit the regime>",
+  "actions": [
+    "<concrete action 1>",
+    "<concrete action 2>"
+  ]
+}}
+
+GUIDELINES:
+- HIGH VIX (>70 percentile): tilt toward MORE cash (+5-10%), MORE short-premium /
+  hedged positions, LESS long-premium (volatility decay risk).
+- LOW VIX (<30 percentile): tilt toward LESS cash, MORE long-premium opportunity,
+  modest increase in directional bets.
+- NORMAL (30-70): keep user targets mostly intact, suggest only minor tweaks.
+- If actual is materially different from target, flag it in the actions.
+- DO NOT recommend specific stocks or trades; just allocation framework changes.
+
+Return ONLY the JSON, no markdown fences or preamble."""
+
+    try:
+        response = anthropic_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        ai_text = "".join(b.text for b in response.content if hasattr(b, "text"))
+    except Exception as e:
+        logger.exception("Allocation recommend: AI call failed: %s", e)
+        return jsonify({"error": f"AI call failed: {str(e)[:200]}"}), 500
+
+    # Parse JSON from AI response
+    ai_text = ai_text.strip()
+    # Strip markdown fences if Claude added them
+    if ai_text.startswith("```"):
+        ai_text = re.sub(r'^```(?:json)?\n', '', ai_text)
+        ai_text = re.sub(r'\n```$', '', ai_text)
+    try:
+        ai_result = json.loads(ai_text)
+    except json.JSONDecodeError as e:
+        logger.warning("Allocation recommend: AI returned invalid JSON: %s", ai_text[:200])
+        return jsonify({
+            "error":       "AI returned malformed response",
+            "raw_response": ai_text[:500],
+        }), 500
+
+    return jsonify({
+        "regime": {
+            "vix_level":      vix_level,
+            "vix_percentile": vix_pct,
+            "label":          vix_label,
+        },
+        "user_targets":     user_targets,
+        "adjusted_targets": ai_result.get("adjusted_targets", {}),
+        "rationale":        ai_result.get("rationale", ""),
+        "actions":          ai_result.get("actions", []),
+        "as_of":            datetime.utcnow().isoformat() + "Z",
+    }), 200
+
+
 @app.route("/api/hedge-suggestions", methods=["POST"])
 @limiter.limit(AI_RATE_LIMIT)
 def hedge_suggestions():
     """
-    Generate hedge suggestions for the current book.
-    Takes risk-dashboard data as POST body to avoid duplicate Yahoo fetches.
+    Generate hedge suggestions for the current book.    Takes risk-dashboard data as POST body to avoid duplicate Yahoo fetches.
     """
     if not anthropic_client:
         return jsonify({"error": "AI service not configured"}), 500
